@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -18,6 +19,8 @@ DATA = Path(os.environ.get("READER_DATA", Path.home() / "reader" / "data"))
 BOOKS = DATA / "books"
 CACHE = DATA / "cache"
 SEGMENT_SECS = 75      # target length of one audio segment (a few sentences, or one very long one)
+PIPELINE = 2           # bump when segmentation/pauses/mastering change: books are re-segmented and re-assembled
+log = logging.getLogger("reader.library")
 CPS = 15.0             # rough spoken chars/second, for estimates before audio exists
 
 _lock = threading.RLock()
@@ -69,22 +72,43 @@ def import_epub(src: Path, original_name: str = "") -> str:
         if bk.cover:
             ext = Path(bk.cover_name or "cover.jpg").suffix.lower() or ".jpg"
             (d / f"cover{ext}").write_bytes(bk.cover)
-        chapters = []
-        for ch in bk.chapters:
-            us = segment.units(ch, bk.lang) if ch.include else []
-            segs = _segments(us)
-            _write(d / "chapters" / f"{ch.index}.json", dict(
-                index=ch.index, title=ch.title, role=ch.role, include=ch.include,
-                blocks=[dict(kind=b.kind, text=b.text, level=b.level) for b in ch.blocks],
-                units=[dict(id=u.id, block=u.block, start=u.start, end=u.end, spoken=u.spoken, role=u.role,
-                            kind=u.kind, pause=u.pause) for u in us],
-                segments=segs))
-            chapters.append(dict(index=ch.index, title=ch.title, role=ch.role, include=ch.include,
-                                 n_units=len(us), n_segments=len(segs), est=round(sum(s["est"] for s in segs))))
+        chapters = _write_chapters(d, bk)
         _write(d / "meta.json", dict(id=book_id, title=bk.title, author=bk.author, lang=bk.lang,
                                      voice=DEFAULT_VOICE.get(bk.lang, DEFAULT_VOICE["en"]), chapters=chapters,
-                                     source=original_name or src.name, added=time.time()))
+                                     source=original_name or src.name, added=time.time(), pipeline=PIPELINE))
     return book_id
+
+
+def _write_chapters(d: Path, bk) -> list[dict]:
+    chapters = []
+    for ch in bk.chapters:
+        us = segment.units(ch, bk.lang) if ch.include else []
+        segs = _segments(us)
+        _write(d / "chapters" / f"{ch.index}.json", dict(
+            index=ch.index, title=ch.title, role=ch.role, include=ch.include,
+            blocks=[dict(kind=b.kind, text=b.text, level=b.level) for b in ch.blocks],
+            units=[dict(id=u.id, block=u.block, start=u.start, end=u.end, spoken=u.spoken, role=u.role,
+                        kind=u.kind, pause=u.pause) for u in us],
+            segments=segs))
+        chapters.append(dict(index=ch.index, title=ch.title, role=ch.role, include=ch.include,
+                             n_units=len(us), n_segments=len(segs), est=round(sum(s["est"] for s in segs))))
+    return chapters
+
+
+def upgrade_all() -> None:
+    """Re-segment books made by an older pipeline; their audio is re-assembled (cached takes are reused when valid)."""
+    for mp in sorted(BOOKS.glob("*/meta.json")):
+        m = _read(mp)
+        if not m or m.get("pipeline", 1) >= PIPELINE:
+            continue
+        d = mp.parent
+        log.info("upgrading %s to pipeline %d", m["id"], PIPELINE)
+        with _lock:
+            bk = bookmod.load(d / "book.epub")
+            m["chapters"] = _write_chapters(d, bk)
+            m["pipeline"] = PIPELINE
+            shutil.rmtree(d / "audio", ignore_errors=True)
+            _write(mp, m)
 
 
 def list_books() -> list[dict]:
@@ -124,6 +148,11 @@ def chapter(book_id: str, index: int) -> dict:
 
 def audio_dir(book_id: str, ch: int) -> Path:
     return book_dir(book_id) / "audio" / str(int(ch))
+
+
+def chapter_file_ready(book_id: str, ch: int) -> bool:
+    d = audio_dir(book_id, ch)
+    return (d / "full.m4a").exists() and (d / "full.json").exists()
 
 
 def segment_ready(book_id: str, ch: int, s: int) -> bool:

@@ -47,6 +47,7 @@ worker = Worker()
 def _start():
     lib.BOOKS.mkdir(parents=True, exist_ok=True)
     lib.CACHE.mkdir(parents=True, exist_ok=True)
+    lib.upgrade_all()
     worker.start()
 
 
@@ -102,6 +103,16 @@ def healthz():
 @app.get("/", response_class=HTMLResponse)
 def index():
     return FileResponse(WEB / "index.html", headers={"cache-control": "no-cache"})
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return FileResponse(WEB / "manifest.webmanifest", media_type="application/manifest+json", headers={"cache-control": "no-cache"})
+
+
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(WEB / "sw.js", media_type="text/javascript", headers={"cache-control": "no-cache", "service-worker-allowed": "/"})
 
 
 app.mount("/static", StaticFiles(directory=WEB), name="static")
@@ -212,6 +223,7 @@ def get_chapter(book_id: str, n: int):
     st = lib.chapter_status(book_id, n, len(c["segments"]))
     for seg, ready in zip(c["segments"], st):
         seg["ready"] = ready
+    c["full"] = lib.chapter_file_ready(book_id, n)
     c["units"] = [dict(i=i, block=u["block"], start=u["start"], end=u["end"], role=u["role"]) for i, u in enumerate(c["units"])]
     return c
 
@@ -223,6 +235,24 @@ def get_segment(book_id: str, n: int, s: int):
     if not p.exists():
         raise HTTPException(404, "not rendered yet")
     return JSONResponse(json.loads(p.read_text()))
+
+
+@app.get("/api/books/{book_id}/chapters/{n}/timeline")
+def get_chapter_timeline(book_id: str, n: int):
+    _book_or_404(book_id)
+    p = lib.audio_dir(book_id, n) / "full.json"
+    if not p.exists():
+        raise HTTPException(404, "chapter not complete yet")
+    return JSONResponse(json.loads(p.read_text()))
+
+
+@app.get("/api/books/{book_id}/chapter-audio/{n}.m4a")
+def get_chapter_audio(book_id: str, n: int):
+    _book_or_404(book_id)
+    p = lib.audio_dir(book_id, n) / "full.m4a"
+    if not p.exists():
+        raise HTTPException(404, "chapter not complete yet")
+    return FileResponse(p, media_type="audio/mp4", headers={"cache-control": "private, max-age=31536000, immutable"})
 
 
 @app.get("/api/books/{book_id}/audio/{n}/{s}.m4a")
@@ -249,13 +279,17 @@ def focus(book_id: str, body: FocusIn):
 class PositionIn(BaseModel):
     chapter: int
     unit: int
-    t: float = 0.0
+    t: float = 0.0           # seconds into the chapter
+    at: float | None = None  # client timestamp (ms) of this position, for offline catch-up
 
 
 @app.put("/api/books/{book_id}/position")
 def put_position(book_id: str, body: PositionIn):
     _book_or_404(book_id)
     worker.set_focus(book_id, body.chapter, body.unit)
+    cur = lib.position(book_id) or {}
+    if body.at and cur.get("updated") and body.at / 1000 < cur["updated"] - 1:
+        return cur      # an older offline write arriving late: keep the newer position
     return lib.set_position(book_id, body.chapter, body.unit, body.t)
 
 

@@ -1,5 +1,26 @@
 # Roadmap: making the reading and the app as good as possible
 
+**Decided 2026-11-26 (owner):** few features, each solid. Dropped:
+- re-roll / pronunciation-fix UI
+- sleep timer
+- bookmarks
+- export
+- character voices
+
+**Done in pipeline 2:**
+- narration pace (Phonon duration_delta 1.0: ~187 wpm in Spanish)
+- YouTube-style speed control
+- length-scaled pauses
+- mastering: −19 LUFS, peaks −3 dB, room tone
+- rewind on resume after any stop, snapped to a pause in the speech
+- one continuous file per finished chapter
+- retry on network loss
+- local + server position
+- one-tap continue
+- installable web app (manifest, icons, service worker)
+
+**Next:** confirm background audio on the iPhone with the screen locked, including across chapter changes.
+
 Impact/effort: **H/M/L**. Measurements are from our own output (Temporada de huracanes, ch. II, 2026-11-26).
 
 ## A. Narration (how it sounds)

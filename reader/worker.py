@@ -23,6 +23,24 @@ def _unit(c: dict, i: int) -> Unit:
                 role=d["role"], kind=d["kind"], pause=d["pause"])
 
 
+LIMITER = "alimiter=limit=0.68:attack=5:release=80:level=disabled"   # peaks <= -3.3 dBFS (audiobook spec: <= -3 dB)
+
+
+def _encode(wavs: list[Path], dst: Path) -> None:
+    """AAC with the peak limiter; several wavs are joined sample-exactly (concat demuxer) before encoding."""
+    tmp = dst.with_name(dst.stem + ".tmp.m4a")
+    if len(wavs) == 1:
+        src = ["-i", str(wavs[0])]
+    else:
+        lst = dst.with_suffix(".txt")
+        lst.write_text("".join(f"file '{w.resolve()}'\n" for w in wavs))
+        src = ["-f", "concat", "-safe", "0", "-i", str(lst)]
+    subprocess.run(["ffmpeg", "-y", "-v", "error", *src, "-af", LIMITER, "-c:a", "aac", "-b:a", "80k",
+                    "-movflags", "+faststart", str(tmp)], check=True)
+    os.replace(tmp, dst)
+    dst.with_suffix(".txt").unlink(missing_ok=True)
+
+
 class Worker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="render-worker")
@@ -113,20 +131,39 @@ class Worker(threading.Thread):
                     return
         out = lib.audio_dir(m["id"], chap["index"])
         out.mkdir(parents=True, exist_ok=True)
-        wav = out / f"{s}.wav"
+        wav = out / f"{s}.wav"                       # kept until the whole chapter is joined into one file
         tl = assemble(units, metas, cache, wav, lead_in=0.0)
-        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav), "-c:a", "aac", "-b:a", "80k", "-movflags", "+faststart",
-                        str(out / f"{s}.m4a.tmp.m4a")], check=True)
-        os.replace(out / f"{s}.m4a.tmp.m4a", out / f"{s}.m4a")
-        wav.unlink(missing_ok=True)
+        _encode([wav], out / f"{s}.m4a")
         units_out = []
         for k, (u, ut) in enumerate(zip(units, tl["units"])):
             text = chap["blocks"][u.block]["text"]
             units_out.append(dict(i=seg["u0"] + k, t0=ut["t0"], t1=ut["t1"],
                                   words=timing.map_words(text, u.start, u.end, ut["words"], ut["t0"], ut["t1"])))
         lib._write(out / f"{s}.json", dict(duration=tl["duration"], units=units_out))
+        self.build_chapter(m, chap)
         took = time.time() - t0
         self.status["rendered_secs"] += tl["duration"]
         if took > 1:
             r = tl["duration"] / took
             self.status["rate"] = round(r if self.status["rate"] is None else 0.7 * self.status["rate"] + 0.3 * r, 2)
+
+    def build_chapter(self, m: dict, chap: dict) -> None:
+        """Once every segment exists, join them into one continuous chapter file (no hand-offs while listening)."""
+        import soundfile as sf
+        ch, n = chap["index"], len(chap["segments"])
+        out = lib.audio_dir(m["id"], ch)
+        wavs = [out / f"{s}.wav" for s in range(n)]
+        if lib.chapter_file_ready(m["id"], ch) or not all(w.exists() and lib.segment_ready(m["id"], ch, s) for s, w in enumerate(wavs)):
+            return
+        units, offset = [], 0.0
+        for s, w in enumerate(wavs):
+            seg = lib._read(out / f"{s}.json")
+            for u in seg["units"]:
+                units.append(dict(i=u["i"], t0=round(u["t0"] + offset, 3), t1=round(u["t1"] + offset, 3),
+                                  words=[[a, b, round(t0 + offset, 3), round(t1 + offset, 3)] for a, b, t0, t1 in u["words"]]))
+            offset += sf.info(str(w)).frames / sf.info(str(w)).samplerate
+        _encode(wavs, out / "full.m4a")
+        lib._write(out / "full.json", dict(duration=round(offset, 3), units=units))
+        for w in wavs:
+            w.unlink(missing_ok=True)
+        log.info("chapter file ready: %s ch%s (%.0f s)", m["id"], ch, offset)

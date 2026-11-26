@@ -9,14 +9,19 @@ import numpy as np
 MODELS = {"en": "hf://gradium/phonon-31m-en", "es": "hf://gradium/phonon-40m-es"}
 DEFAULT_VOICE = {"en": "Easton", "es": "Alba"}
 SR = 24000
-VERSION = "phonon-1"  # bump to invalidate cached takes
+VERSION = "phonon-2"  # bump to invalidate cached takes
+# Native narration pace (Phonon's duration_delta conditioner). 0 = model default (~209 wpm es / ~236 wpm en);
+# 1.0 measured ~177 / ~195 wpm with unchanged alignment scores and pitch variation. Saturates around 2.0.
+PACE = {"es": 1.0, "en": 1.0}
 
 
 @functools.lru_cache(maxsize=4)
 def _tts(lang: str, quant: str):
     import ptts
     ptts.set_num_threads(int(os.environ.get("READER_THREADS", "4")))
-    return ptts.TTS(MODELS[lang], lang=lang, quant=quant, rewrites="none")
+    tts = ptts.TTS(MODELS[lang], lang=lang, quant=quant, rewrites="none")
+    tts.set_conditions({"duration_delta": PACE.get(lang, 0.0)})
+    return tts
 
 
 class Engine:
@@ -26,7 +31,7 @@ class Engine:
 
     @property
     def key(self) -> str:
-        return f"{VERSION}:{self.lang}:{self.voice}:{self.quant}"
+        return f"{VERSION}:{self.lang}:{self.voice}:{self.quant}:pace{PACE.get(self.lang, 0.0)}"
 
     def synth(self, text: str, seed: int, temperature: float = 0.3) -> np.ndarray:
         return np.asarray(self.tts.synth(text, voice=self.voice, seed=seed, temperature=temperature), dtype=np.float32)

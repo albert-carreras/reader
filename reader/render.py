@@ -157,7 +157,20 @@ def _learn(stats: VoiceStats, meta: dict):
 
 # ---------------------------------------------------------------- assembly
 
-def _level(audio: np.ndarray, target_db: float = -20.0, max_gain_db: float = 4.0) -> np.ndarray:
+ROOM_TONE_DB = -64.0   # audiobook spec wants room tone, noise floor <= -60 dB; digital silence sounds "dead"
+
+
+def room_tone(n: int, seed: int = 0) -> np.ndarray:
+    """A faint, warm noise bed (low-passed white noise) at ROOM_TONE_DB RMS."""
+    from scipy.signal import lfilter
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(n).astype(np.float32)
+    k = np.exp(-2 * np.pi * 1200 / SR)        # one-pole low-pass ~1.2 kHz
+    y = lfilter([1 - k], [1, -k], x).astype(np.float32)
+    y *= (10 ** (ROOM_TONE_DB / 20)) / (np.sqrt(np.mean(y ** 2)) + 1e-12)
+    return y
+
+def _level(audio: np.ndarray, target_db: float = -19.0, max_gain_db: float = 4.0) -> np.ndarray:
     rms = np.sqrt(np.mean(audio ** 2) + 1e-12)
     gain_db = np.clip(target_db - 20 * np.log10(rms), -max_gain_db, max_gain_db)
     return audio * (10 ** (gain_db / 20))
@@ -186,8 +199,9 @@ def assemble(units: list[Unit], metas: list[dict], cache: Path, out_wav: Path, l
         pieces += [a, np.zeros(int(SR * u.pause), np.float32)]
         t += len(a) / SR + u.pause
     audio = np.concatenate(pieces)
+    audio = audio + room_tone(len(audio), seed=zlib.crc32(out_wav.name.encode() + str(len(audio)).encode()))
     peak = np.max(np.abs(audio)) + 1e-9
-    if peak > 0.97:
+    if peak > 0.97:                 # hard safety only; the real limiter (-3 dB ceiling) runs at encode time
         audio *= 0.97 / peak
     sf.write(out_wav, audio, SR, subtype="PCM_16")
     return dict(duration=round(len(audio) / SR, 2), units=timeline)

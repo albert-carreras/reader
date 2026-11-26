@@ -15,9 +15,15 @@ WH = {
     "en": r"((but|and|so|then|oh|well)\s*,?\s+)?(what|who|whom|whose|which|where|when|why|how)",
 }
 
-# pauses in seconds
-P = dict(sentence=0.32, question=0.40, exclaim=0.38, continuation=0.12, trailing=0.55, inner_tag=0.16,
-         paragraph=0.70, dialogue_turn=0.55, heading=1.0, scene=1.6, verse_line=0.32, stanza=0.85, chapter_end=1.5)
+# Pauses in seconds. Measured human read-aloud: 0.2-1.4 s after sentences, longer after longer sentences
+# (up to x1.4); paragraph breaks clearly longer than sentence breaks. Sentence/paragraph pauses scale with length.
+P = dict(sentence=0.40, question=0.48, exclaim=0.46, continuation=0.18, trailing=0.65, inner_tag=0.20,
+         paragraph=0.85, dialogue_turn=0.70, heading=1.3, scene=2.0, verse_line=0.45, stanza=1.0, chapter_end=2.5)
+
+
+def _scaled(base: float, chars: int, full: int = 260, extra: float = 0.4) -> float:
+    """Longer sentences/paragraphs earn a longer breath afterwards (up to +40%)."""
+    return round(base * (1 + extra * min(1.0, chars / full)), 3)
 
 
 @dataclass
@@ -187,9 +193,11 @@ def _kind(t: str, lang: str, last_in_sentence: bool) -> str:
     return "statement"
 
 
-def _end_pause(kind: str) -> float:
-    return {"yesno": P["question"], "wh": P["question"], "exclaim": P["exclaim"], "trailing": P["trailing"],
-            "continuation": P["continuation"]}.get(kind, P["sentence"])
+def _end_pause(kind: str, chars: int = 0) -> float:
+    if kind == "continuation":
+        return P["continuation"]
+    base = {"yesno": P["question"], "wh": P["question"], "exclaim": P["exclaim"], "trailing": P["trailing"]}.get(kind, P["sentence"])
+    return _scaled(base, chars)
 
 
 # ---------------------------------------------------------------- chapter -> units
@@ -243,7 +251,7 @@ def units(ch: Chapter, lang: str) -> list[Unit]:
                         continue
                     last = pi == len(parts) - 1
                     kind = _kind(disp, lang, last)
-                    bu.append(Unit("", bi, ps, pe, disp, spoken, role, kind, _end_pause(kind)))
+                    bu.append(Unit("", bi, ps, pe, disp, spoken, role, kind, _end_pause(kind, pe - ps)))
         # pauses between dialogue and its tag are short when the speech continues
         for u, v in zip(bu, bu[1:]):
             if u.role != v.role:
@@ -257,7 +265,7 @@ def units(ch: Chapter, lang: str) -> list[Unit]:
                 if p in (".", "!", "?", "…"):
                     u.spoken += p
                     u.kind = _kind(u.spoken, lang, True)
-                    u.pause = _end_pause(u.kind)
+                    u.pause = _end_pause(u.kind, u.end - u.start)
                 elif j + 1 < len(bu):
                     u.spoken += ","
                     u.kind, u.pause = "continuation", P["inner_tag"]
@@ -266,7 +274,8 @@ def units(ch: Chapter, lang: str) -> list[Unit]:
         if bu:
             nxt = next((b for b in ch.blocks[bi + 1:] if b.kind != "scene_break"), None)
             turn = nxt is not None and (nxt.text.lstrip()[:1] in RAYA + "“«\"‘")
-            bu[-1].pause = max(bu[-1].pause, P["dialogue_turn"] if turn else P["paragraph"])
+            para = P["dialogue_turn"] if turn else _scaled(P["paragraph"], len(text), full=700, extra=0.3)
+            bu[-1].pause = max(bu[-1].pause, para)
         for j, u in enumerate(bu):
             u.id = f"{ch.index:03d}.{bi:04d}.{j:02d}"
         out += bu

@@ -14,7 +14,7 @@
   "vpc_networks": [
     {
       "binding": "READER_ORIGIN",
-      "tunnel_id": "TUNNEL_ID",
+      "tunnel_id": "a86c228a-e459-412b-8e09-eda6c6f150e4",
       "remote": true
     }
   ]

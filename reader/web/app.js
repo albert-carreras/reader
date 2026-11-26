@@ -26,7 +26,10 @@ const api = async (path, opts = {}) => {
     if (isGet) { const v = await idb.get(path).catch(() => null); if (v?.type === "json") return v.data; }
     throw new Error("You're offline");
   }
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  if (!r.ok) {
+    if (isGet && r.status >= 500) { const v = await idb.get(path).catch(() => null); if (v?.type === "json") return v.data; }   // server restarting
+    throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  }
   const j = await r.json();
   if (isGet && KEEP_OFFLINE.test(path)) idb.put(path, { type: "json", data: j }).catch(() => {});
   return j;
@@ -844,7 +847,7 @@ const player = {
     if (play) {
       this.userPaused = false;
       this.ownPlayAt = Date.now();
-      try { await audio.play(); } catch { this.$.status.textContent = "Tap play to start"; }
+      try { await audio.play(); } catch { this.$.status.replaceChildren(h("span", { class: "waiting" }, "Tap play to start")); }
       this.wake(true);
     }
     this.setPlayIcon(audio.paused);
@@ -922,12 +925,16 @@ const player = {
   // network trouble (car, tunnel, metro): keep the place and retry with backoff
   onError(stalled = false) {
     // only network trouble is worth retrying; a decode error would just loop
-    if (!this.root || this.userPaused || (!stalled && audio.error && audio.error.code !== MediaError.MEDIA_ERR_NETWORK)) return;
+    // retry network trouble and server hiccups (a 5xx shows up as "not supported"); never loop on a local file
+    const code = audio.error?.code;
+    if (!this.root || this.userPaused || audio.src.startsWith("blob:")) return;
+    if (!stalled && code && code !== MediaError.MEDIA_ERR_NETWORK && code !== MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) return;
+    if (this.retry > 8) { this.$.status.replaceChildren(h("span", { class: "waiting" }, "Can't reach the server right now")); return; }
     const T = this.chapterTime();
     clearTimeout(this.retryTimer);
     const wait = Math.min(30000, 2000 * 2 ** this.retry++);
-    this.$.status.textContent = `Connection lost — retrying in ${Math.round(wait / 1000)} s…`;
-    this.retryTimer = setTimeout(async () => { this.piece = -1; await this.seek(T, true); if (!audio.paused) { this.retry = 0; this.$.status.textContent = ""; } }, wait);
+    this.$.status.replaceChildren(h("span", { class: "waiting" }, h("span", { class: "spinner" }), `Connection lost · retrying in ${Math.round(wait / 1000)} s`));
+    this.retryTimer = setTimeout(async () => { this.piece = -1; await this.seek(T, true); if (!audio.paused) { this.retry = 0; this.hideWaiting(); } }, wait);
   },
 
   // ---------- highlight & time
@@ -1040,7 +1047,7 @@ let stallTimer = 0;
 audio.addEventListener("waiting", () => { clearTimeout(stallTimer); stallTimer = setTimeout(() => { if (player.root && !player.userPaused && audio.readyState < 3) player.onError(true); }, 12000); });
 audio.addEventListener("playing", () => clearTimeout(stallTimer));
 audio.addEventListener("play", () => { player.setPlayIcon(false); });
-audio.addEventListener("playing", () => { player.retry = 0; if (player.$?.status && /retrying/.test(player.$.status.textContent)) player.$.status.textContent = ""; });
+audio.addEventListener("playing", () => { player.retry = 0; if (player.$?.status && /retrying|reach/.test(player.$.status.textContent)) player.hideWaiting(); });
 audio.addEventListener("pause", () => {
   player.wake(false);
   player.setPlayIcon(true);

@@ -1,6 +1,6 @@
 // reader service worker: keeps the app shell available so the app opens instantly and offline.
 // Book data and audio always come from the network (audio is cached by the browser's HTTP cache).
-const SHELL = "reader-shell-v2";
+const SHELL = "reader-shell-v3";
 const FILES = ["/", "/static/app.js", "/static/style.css", "/manifest.webmanifest", "/static/icons/icon-192.png", "/static/icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {
@@ -17,8 +17,9 @@ self.addEventListener("fetch", (e) => {
   if (!(e.request.mode === "navigate" || FILES.includes(url.pathname) || url.pathname.startsWith("/static/"))) return;
   // network first (so updates land immediately), cached shell when offline
   e.respondWith(
-    fetch(e.request).then((r) => {
+    fetch(e.request).then(async (r) => {
       if (r.ok && r.type === "basic") { const copy = r.clone(); caches.open(SHELL).then((c) => c.put(e.request.mode === "navigate" ? "/" : e.request, copy)); }
+      if (r.status >= 500) return (await caches.match(e.request.mode === "navigate" ? "/" : e.request)) || r;   // server restarting: keep the app up
       return r;
     }).catch(() => caches.match(e.request.mode === "navigate" ? "/" : e.request))
   );

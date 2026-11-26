@@ -37,7 +37,14 @@ def _caps_fix(s: str) -> str:
     if len(letters) >= 4 and sum(c.isupper() for c in letters) / len(letters) > 0.7:
         low = s.lower()
         return re.sub(r"(^|[.!?¿¡:]\s*)(\w)", lambda m: m.group(1) + m.group(2).upper(), low)
-    # shouting words inside normal text: MARIANELA -> Marianela (keep short acronyms like BBC)
+    # runs of capitalised words (small-caps openings: "ALTHOUGH I HAVE LOVED MANY, there...") read as normal words
+    def run(m):
+        words = m.group(0)
+        low = re.sub(r"[A-ZÁÉÍÓÚÑÜ]+", lambda w: w.group(0) if w.group(0) == "I" else w.group(0).lower(), words)
+        return low[:1].upper() + low[1:] if m.start() == 0 or re.search(r"[.!?¿¡:]\s*$", s[:m.start()]) else low
+    s = re.sub(r"\b[A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ'’]*(?:[\s,]+[A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ'’]*)+\b",
+               lambda m: run(m) if sum(c.isalpha() for c in m.group(0)) >= 6 and not all(roman_to_int(w) for w in re.findall(r"\w+", m.group(0))) else m.group(0), s)
+    # single shouting words inside normal text: MARIANELA -> Marianela (keep short acronyms like BBC)
     return re.sub(r"\b([A-ZÁÉÍÓÚÑÜ]{5,})\b", lambda m: m.group(1).capitalize() if not roman_to_int(m.group(1)) else m.group(1), s)
 
 
@@ -63,7 +70,7 @@ def pre_rules(s: str, lang: str) -> str:
     s = re.sub(r"[*†‡#_~|<>\[\]{}]", " ", s)
     s = re.sub(r"\.{3,}|…+", "…", s)
     # dashes used as parentheses inside a sentence read as commas
-    s = re.sub(r"\s*[—―]\s*", ", ", s).strip(" ,")
+    s = re.sub(r"\s*[—―]\s*|\s+[–-]\s+", ", ", s).strip(" ,")     # spaced en/em dashes too ("life – Rachel")
     if lang == "es":
         # 19th-century orthography: the preposition/conjunctions written with an accent
         s = re.sub(r"(?<![\wÁÉÍÓÚáéíóú])([áéóúÁÉÓÚ])(?![\wÁÉÍÓÚáéíóú])", lambda m: {"á": "a", "é": "e", "ó": "o", "ú": "u", "Á": "A", "É": "E", "Ó": "O", "Ú": "U"}[m.group(1)], s)

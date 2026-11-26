@@ -76,3 +76,18 @@ def test_quote_tag_keeps_sentence_open():
     got = _units("“And what is the use of a book,” thought Alice “without pictures or conversations?”", "en")
     assert got[1] == ("tag", "continuation", "thought Alice,")
     assert got[2][1] == "yesno"
+
+
+def test_small_caps_opening():
+    assert speak("ALTHOUGH I HAVE LOVED MANY, there has been only one.", "en").startswith("Although I have loved many, there")
+    assert speak("He works for the BBC in London.", "en") == "He works for the BBC in London."
+
+
+def test_hard_wrapped_prose_is_not_verse():
+    from reader.book import _looks_like_verse, _unwrap
+    prose = "ALTHOUGH I HAVE\nLOVED MANY, there has been only one genuine love in my\nnear-eternally stretched life – Rachel who fell to the bottom of\nthe library without me. Did I know her only for so short a time?"
+    assert not _looks_like_verse(prose)
+    assert _unwrap(prose).startswith("ALTHOUGH I HAVE LOVED MANY, there has been only one genuine love in my near-eternally")
+    assert _unwrap("our con-\nsciousness ever after") == "our consciousness ever after"
+    poem = "How doth the little crocodile\nImprove his shining tail,\nAnd pour the waters of the Nile\nOn every golden scale!"
+    assert _looks_like_verse(poem)

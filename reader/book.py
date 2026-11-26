@@ -139,6 +139,24 @@ def _inline_text(el: Tag) -> str:
     return clean("".join(parts))
 
 
+def _unwrap(text: str) -> str:
+    """Prose hard-wrapped at printed line ends (common in converted EPUBs): join the lines back up."""
+    text = re.sub(r"(\w)-\n(?=[a-záéíóúñü])", r"\1", text)      # "con-\nsciousness" -> "consciousness"
+    return re.sub(r"\s*\n\s*", " ", text).strip()
+
+
+def _looks_like_verse(text: str) -> bool:
+    """Line breaks alone don't make a poem. Verse lines mostly start with a capital or end with punctuation
+    and are short; hard-wrapped prose mostly runs on mid-sentence into lowercase."""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 3:          # one break proves nothing; unmarked two-liners are wrapped prose
+        return False
+    starts_upper = sum(1 for l in lines[1:] if l[:1].isupper() or l[:1] in "¿¡\"“«‘—") / max(1, len(lines) - 1)
+    ends_punct = sum(1 for l in lines[:-1] if l[-1:] in ".,;:!?…—\"”»’") / max(1, len(lines) - 1)
+    median_len = sorted(map(len, lines))[len(lines) // 2]
+    return median_len < 55 and (starts_upper >= 0.6 or ends_punct >= 0.6)
+
+
 def _in_verse(el: Tag) -> bool:
     for a in [el, *el.parents]:
         if not isinstance(a, Tag) or a.name in ("body", "html"):
@@ -173,15 +191,15 @@ def _walk(el: Tag, out: list[Block], quote: bool = False) -> None:
     elif el.name in HEADING_TAGS or re.search(r"\b(title|titulo|heading|chapter-title|capitulo)\b", _types(el)):
         level = int(el.name[1]) if el.name in HEADING_TAGS else 3
         out.append(Block("heading", text.replace("\n", " "), level=level))
-    elif _in_verse(el) or (text.count("\n") >= 2 and max(map(len, text.split("\n"))) < 70):
+    elif "\n" in text and (_in_verse(el) or _looks_like_verse(text)):
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         out.append(Block("verse", "\n".join(lines), lines=lines))
     elif el.name == "li":
-        out.append(Block("item", text.replace("\n", " ")))
+        out.append(Block("item", _unwrap(text)))
     elif el.name == "figcaption":
-        out.append(Block("caption", text.replace("\n", " ")))
+        out.append(Block("caption", _unwrap(text)))
     else:
-        out.append(Block("quote" if quote else "para", text.replace("\n", " ")))
+        out.append(Block("quote" if quote else "para", _unwrap(text)))
 
 
 def parse_html(html: bytes | str) -> list[Block]:
@@ -221,6 +239,16 @@ def _tidy_chapter(blocks: list[Block], book_title: str) -> list[Block]:
     elif out and NUMERAL.match(out[0].text.strip()):
         out[0] = Block("heading", out[0].text.strip(), level=out[0].level or 2)
     return out
+
+
+def _looks_like_copyright(blocks: list[Block]) -> bool:
+    text = " ".join(b.text for b in blocks)
+    if len(text) > 4000:
+        return False
+    hits = sum(bool(re.search(p, text, re.I)) for p in (r"copyright|©|derechos reservados|copyright ©", r"\bISBN\b",
+           r"all rights reserved|todos los derechos|reservados todos", r"first (published|edition)|primera edición|printed in|impreso en",
+           r"library of congress|cataloging|depósito legal|publisher|editorial"))
+    return hits >= 2
 
 
 def _looks_like_title_page(blocks: list[Block]) -> bool:
@@ -295,6 +323,8 @@ def load(path: str | Path) -> Book:
         role = _role(types, href, title or "")
         if role == "body" and _looks_like_title_page(blocks):
             role = "titlepage"
+        if role == "body" and _looks_like_copyright(blocks):
+            role = "copyright-page"
         if title is None and chapters and role == "body":
             chapters[-1].blocks += blocks  # chapter split across files
             continue

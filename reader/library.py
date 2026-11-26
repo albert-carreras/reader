@@ -19,7 +19,7 @@ DATA = Path(os.environ.get("READER_DATA", Path.home() / "reader" / "data"))
 BOOKS = DATA / "books"
 CACHE = DATA / "cache"
 SEGMENT_SECS = 75      # target length of one audio segment (a few sentences, or one very long one)
-PIPELINE = 2           # bump when segmentation/pauses/mastering change: books are re-segmented and re-assembled
+PIPELINE = 3           # bump when segmentation/pauses/mastering change: books are re-segmented and re-assembled
 log = logging.getLogger("reader.library")
 CPS = 15.0             # rough spoken chars/second, for estimates before audio exists
 

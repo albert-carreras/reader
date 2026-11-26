@@ -116,6 +116,7 @@ def list_books() -> list[dict]:
     for d in sorted(BOOKS.glob("*/meta.json")):
         m = _read(d)
         if m:
+            m.setdefault("render", True)
             m["position"] = position(m["id"])
             m["progress"] = progress(m)
             out.append(m)
@@ -126,6 +127,7 @@ def meta(book_id: str) -> dict:
     m = _read(book_dir(book_id) / "meta.json")
     if not m:
         raise KeyError(book_id)
+    m.setdefault("render", True)
     return m
 
 
@@ -193,3 +195,107 @@ def delete(book_id: str) -> None:
 
 def cover_path(book_id: str) -> Path | None:
     return next(iter(sorted(book_dir(book_id).glob("cover.*"))), None)
+
+
+# ---------------------------------------------------------------- rendering control, language, storage
+
+SETTINGS = DATA / "settings.json"
+LANGS = {"es": "Spanish", "en": "English"}
+
+
+def settings() -> dict:
+    s = _read(SETTINGS, {}) or {}
+    return {"paused": bool(s.get("paused", False)), "threads": int(s.get("threads", int(os.environ.get("READER_THREADS", "4"))))}
+
+
+def set_settings(**kw) -> dict:
+    with _lock:
+        s = settings()
+        s.update({k: v for k, v in kw.items() if v is not None})
+        DATA.mkdir(parents=True, exist_ok=True)
+        _write(SETTINGS, s)
+    return s
+
+
+def set_render(book_id: str, on: bool) -> dict:
+    with _lock:
+        m = meta(book_id)
+        m["render"] = bool(on)
+        _write(book_dir(book_id) / "meta.json", m)
+    return m
+
+
+def set_lang(book_id: str, lang: str) -> dict:
+    """Re-read the book as another language: new text normalisation, that language's narrator, fresh audio."""
+    if lang not in LANGS:
+        raise ValueError(lang)
+    with _lock:
+        m = meta(book_id)
+        if lang == m["lang"]:
+            return m
+        d = book_dir(book_id)
+        bk = bookmod.load(d / "book.epub")
+        bk.lang = lang
+        m.update(lang=lang, voice=DEFAULT_VOICE[lang], chapters=_write_chapters(d, bk), pipeline=PIPELINE)
+        shutil.rmtree(d / "audio", ignore_errors=True)
+        _write(d / "meta.json", m)
+    return m
+
+
+def clear_audio(book_id: str) -> int:
+    d = book_dir(book_id) / "audio"
+    freed = _size(d)
+    shutil.rmtree(d, ignore_errors=True)
+    return freed
+
+
+def _size(p: Path) -> int:
+    if p.is_file():
+        return p.stat().st_size
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
+
+
+def _live_take_keys() -> set[str]:
+    """Cache keys every book still needs with its current engine (voice, pace, version)."""
+    from .engine import Engine
+    keys = set()
+    for mp in BOOKS.glob("*/meta.json"):
+        m = _read(mp)
+        if not m:
+            continue
+        ek = Engine.key_for(m["lang"], m["voice"])
+        for c in m["chapters"]:
+            if not c["n_units"]:
+                continue
+            for u in chapter(m["id"], c["index"])["units"]:
+                keys.add(hashlib.sha1(f"{ek}|{u['kind']}|{u['spoken']}".encode()).hexdigest()[:16])
+    return keys
+
+
+def storage() -> dict:
+    total, used, free = shutil.disk_usage(DATA)
+    books = []
+    for mp in sorted(BOOKS.glob("*/meta.json")):
+        m = _read(mp)
+        if m:
+            books.append(dict(id=m["id"], title=m["title"], audio=_size(mp.parent / "audio"), source=_size(mp.parent / "book.epub")))
+    live = _live_take_keys()
+    cache = stale = stale_n = 0
+    for f in CACHE.rglob("*.wav"):
+        sz = f.stat().st_size + (f.with_suffix(".json").stat().st_size if f.with_suffix(".json").exists() else 0)
+        cache += sz
+        if f.name.split(".")[0] not in live:
+            stale += sz
+            stale_n += 1
+    return dict(disk_total=total, disk_free=free, books=books, cache=cache, cache_stale=stale, cache_stale_files=stale_n)
+
+
+def clean_cache() -> int:
+    """Delete cached takes no book can use any more (old pace/voice/version). Returns bytes freed."""
+    live = _live_take_keys()
+    freed = 0
+    for f in list(CACHE.rglob("*")):
+        if f.is_file() and f.name.split(".")[0] not in live:
+            freed += f.stat().st_size
+            f.unlink(missing_ok=True)
+    return freed

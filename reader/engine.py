@@ -31,7 +31,11 @@ class Engine:
 
     @property
     def key(self) -> str:
-        return f"{VERSION}:{self.lang}:{self.voice}:{self.quant}:pace{PACE.get(self.lang, 0.0)}"
+        return self.key_for(self.lang, self.voice, self.quant)
+
+    @staticmethod
+    def key_for(lang: str, voice: str | None = None, quant: str = "f32") -> str:
+        return f"{VERSION}:{lang}:{voice or DEFAULT_VOICE[lang]}:{quant}:pace{PACE.get(lang, 0.0)}"
 
     def synth(self, text: str, seed: int, temperature: float = 0.3) -> np.ndarray:
         return np.asarray(self.tts.synth(text, voice=self.voice, seed=seed, temperature=temperature), dtype=np.float32)

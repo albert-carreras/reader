@@ -54,37 +54,75 @@ class Worker(threading.Thread):
         self.focus = (book_id, int(chapter), int(unit))
         self.wake.set()
 
-    def _default_focus(self):
-        for m in lib.list_books():
-            p = m.get("position")
-            if p:
-                return m["id"], p["chapter"], p["unit"]
-        return None
+    def _order(self):
+        """Books to render, in priority order: the one being listened to first, then the others by recent use.
+        Books with rendering switched off are skipped entirely."""
+        books = [m for m in lib.list_books() if m.get("render", True)]
+        focus = self.focus
+        if focus is None:
+            p = next((m["position"] for m in books if m.get("position")), None)
+            m0 = next((m for m in books if m.get("position")), None)
+            focus = (m0["id"], p["chapter"], p["unit"]) if m0 else None
+        out = []
+        if focus and any(m["id"] == focus[0] for m in books):
+            out.append((next(m for m in books if m["id"] == focus[0]), focus[1], focus[2]))
+        for m in books:
+            if not focus or m["id"] != focus[0]:
+                p = m.get("position") or {}
+                out.append((m, p.get("chapter", 0), p.get("unit", 0)))
+        return out
 
-    def next_job(self):
-        focus = self.focus or self._default_focus()
-        if not focus:
-            return None
-        book_id, ch0, u0 = focus
-        try:
-            m = lib.meta(book_id)
-        except KeyError:
-            self.focus = None
-            return None
+    def _first_missing(self, m: dict, ch0: int, u0: int):
         order = [c for c in m["chapters"] if c["include"] and c["n_segments"]]
         order = [c for c in order if c["index"] >= ch0] + [c for c in order if c["index"] < ch0]   # ahead first, then wrap
         for c in order:
-            chap = lib.chapter(book_id, c["index"])
+            if lib.chapter_status(m["id"], c["index"], c["n_segments"]).count(False) == 0:
+                continue
+            chap = lib.chapter(m["id"], c["index"])
             start_seg = 0
             if c["index"] == ch0:
                 start_seg = next((s for s, seg in enumerate(chap["segments"]) if seg["u0"] <= u0 < seg["u1"]), 0)
-            segs = list(range(start_seg, len(chap["segments"]))) + list(range(0, start_seg))
-            for s in segs:
-                if not lib.segment_ready(book_id, c["index"], s):
+            for s in list(range(start_seg, len(chap["segments"]))) + list(range(0, start_seg)):
+                if not lib.segment_ready(m["id"], c["index"], s):
                     return m, chap, s
         return None
 
+    def next_job(self):
+        if lib.settings()["paused"]:
+            return None
+        for m, ch0, u0 in self._order():
+            job = self._first_missing(m, ch0, u0)
+            if job:
+                return job
+        return None
+
+    def queue(self) -> list[dict]:
+        """Every book with its rendering state, progress and an ETA at the current speed."""
+        rate = self.status.get("rate") or 1.0
+        out, ahead = [], 0.0
+        order = [m for m, *_ in self._order()]
+        rest = [m for m in lib.list_books() if m["id"] not in {o["id"] for o in order}]
+        for m in order + rest:
+            p = lib.progress(m)
+            left = max(0, p["total_est"] - p["ready_est"])
+            eta = None
+            if m.get("render", True) and left:
+                ahead += left / max(rate, 0.1)
+                eta = round(ahead)
+            out.append(dict(id=m["id"], title=m["title"], lang=m["lang"], render=m.get("render", True),
+                            ready=p["ready_est"], total=p["total_est"], eta=eta))
+        return out
+
     # ---------------------------------------------------------------- rendering
+    def _apply_threads(self):
+        n = lib.settings()["threads"]
+        if n != getattr(self, "_threads", None):
+            import ptts, torch
+            ptts.set_num_threads(n)
+            torch.set_num_threads(n)
+            self._threads = n
+            self.status["threads"] = n
+
     def run(self):
         threads = int(os.environ.get("READER_THREADS", "4"))
         os.environ.setdefault("READER_THREADS", str(threads))
@@ -96,9 +134,10 @@ class Worker(threading.Thread):
         torch.set_num_threads(threads)
         while True:
             try:
+                self._apply_threads()
                 job = self.next_job()
                 if job is None:
-                    self.status.update(state="idle", job=None)
+                    self.status.update(state="paused" if lib.settings()["paused"] else "idle", job=None)
                     self.wake.wait(30)
                     self.wake.clear()
                     continue
@@ -125,6 +164,8 @@ class Worker(threading.Thread):
             u = _unit(chap, i)
             metas.append(render_unit(u, eng, stats, cache))
             units.append(u)
+            if lib.settings()["paused"] or not lib.meta(m["id"]).get("render", True):
+                return                               # paused from the UI: stop at the next sentence (takes stay cached)
             if self.focus != focus_at_start:        # listener jumped elsewhere: serve that first
                 nxt = self.next_job()
                 if nxt and (nxt[0]["id"], nxt[1]["index"], nxt[2]) != (m["id"], chap["index"], s):

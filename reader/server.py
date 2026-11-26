@@ -129,7 +129,42 @@ def _book_or_404(book_id: str) -> dict:
 
 @app.get("/api/status")
 def status():
-    return dict(worker=worker.status, focus=worker.focus)
+    st = dict(worker=worker.status, focus=worker.focus, settings=lib.settings())
+    job = worker.status.get("job")
+    if job:
+        q = next((b for b in worker.queue() if b["id"] == job["book"]), None)
+        if q:
+            st["book"] = q
+    return st
+
+
+@app.get("/api/system")
+def system():
+    return dict(worker=worker.status, settings=lib.settings(), queue=worker.queue())
+
+
+class SystemIn(BaseModel):
+    paused: bool | None = None
+    threads: int | None = None
+
+
+@app.put("/api/system")
+def put_system(body: SystemIn):
+    if body.threads is not None and body.threads not in (1, 2, 4, 6, 8, 12):
+        raise HTTPException(400, "threads must be 1, 2, 4, 6, 8 or 12")
+    s = lib.set_settings(paused=body.paused, threads=body.threads)
+    worker.wake.set()
+    return s
+
+
+@app.get("/api/storage")
+def storage():
+    return lib.storage()
+
+
+@app.post("/api/storage/clean")
+def clean_storage():
+    return {"freed": lib.clean_cache()}
 
 
 @app.get("/api/books")
@@ -182,19 +217,40 @@ def get_book(book_id: str):
     m["position"] = lib.position(book_id)
     m["progress"] = lib.progress(m)
     m["voices"] = VOICES.get(m["lang"], VOICES["en"])
+    m["langs"] = lib.LANGS
+    q = next((b for b in worker.queue() if b["id"] == book_id), None)
+    m["eta"] = q and q["eta"]
+    m["rendering_now"] = (worker.status.get("job") or {}).get("book") == book_id
     return m
 
 
-class VoiceIn(BaseModel):
-    voice: str
+class BookIn(BaseModel):
+    voice: str | None = None
+    lang: str | None = None
+    render: bool | None = None
 
 
 @app.patch("/api/books/{book_id}")
-def patch_book(book_id: str, body: VoiceIn):
+def patch_book(book_id: str, body: BookIn):
     m = _book_or_404(book_id)
-    if body.voice not in VOICES.get(m["lang"], []):
-        raise HTTPException(400, "unknown voice")
-    return lib.set_voice(book_id, body.voice)
+    if body.lang is not None:
+        if body.lang not in lib.LANGS:
+            raise HTTPException(400, "unknown language")
+        m = lib.set_lang(book_id, body.lang)
+    if body.voice is not None:
+        if body.voice not in VOICES.get(m["lang"], []):
+            raise HTTPException(400, "unknown voice")
+        m = lib.set_voice(book_id, body.voice)
+    if body.render is not None:
+        m = lib.set_render(book_id, body.render)
+    worker.wake.set()
+    return m
+
+
+@app.delete("/api/books/{book_id}/audio")
+def clear_book_audio(book_id: str):
+    _book_or_404(book_id)
+    return {"freed": lib.clear_audio(book_id)}
 
 
 @app.delete("/api/books/{book_id}")

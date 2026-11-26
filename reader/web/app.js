@@ -16,10 +16,20 @@ const ICON = {
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
 };
 
+const KEEP_OFFLINE = /^\/api\/books(\/[a-z0-9-]+)?$/;      // library + book pages are always kept for offline use
 const api = async (path, opts = {}) => {
-  const r = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
+  const isGet = !opts.method || opts.method === "GET";
+  let r;
+  try {
+    r = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
+  } catch (e) {          // no network: serve what this device has
+    if (isGet) { const v = await idb.get(path).catch(() => null); if (v?.type === "json") return v.data; }
+    throw new Error("You're offline");
+  }
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
-  return r.json();
+  const j = await r.json();
+  if (isGet && KEEP_OFFLINE.test(path)) idb.put(path, { type: "json", data: j }).catch(() => {});
+  return j;
 };
 const h = (tag, attrs = {}, ...kids) => {
   const el = document.createElement(tag);
@@ -38,6 +48,7 @@ const fmt = (s) => {
   return hh ? `${hh}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}` : `${mm}:${String(ss).padStart(2, "0")}`;
 };
 const human = (s) => { s = Math.round(s || 0); const hh = Math.floor(s / 3600), mm = Math.round((s % 3600) / 60); return hh ? `${hh} h ${mm} min` : `${mm} min`; };
+const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k != null && k !== false));
 const toast = (msg, ms = 2800) => { const t = h("div", { class: "toast" }, msg); document.body.append(t); setTimeout(() => t.remove(), ms); };
 const store = {
   get: (k, d) => { try { return JSON.parse(localStorage.getItem("reader:" + k)) ?? d; } catch { return d; } },
@@ -46,7 +57,9 @@ const store = {
 const coverEl = (b) => {
   const c = h("div", { class: "cover" });
   const img = h("img", { src: `/api/books/${b.id}/cover`, alt: "", loading: "lazy" });
-  img.onerror = () => {
+  img.onerror = async () => {
+    const local = await idb.get(`/api/books/${b.id}/cover`).catch(() => null);
+    if (local?.data && !img.dataset.local) { img.dataset.local = "1"; img.src = URL.createObjectURL(local.data); return; }
     img.remove();
     c.classList.add("gen");
     const hue = [...b.title].reduce((a, ch) => a + ch.charCodeAt(0), 0) % 360;
@@ -91,6 +104,113 @@ const positions = {
 };
 addEventListener("online", () => Object.keys(localStorage).filter((k) => k.startsWith("reader:pos:")).forEach((k) => positions.push(k.slice(11))));
 
+// ------------------------------------------------------------------ offline: IndexedDB store + download manager
+// Audio is kept as Blobs in IndexedDB and played through blob: URLs (more reliable on iOS than serving media
+// from a service worker). Book/chapter/timeline JSON is kept alongside so reading-along works offline too.
+const idb = (() => {
+  let dbp;
+  const open = () => (dbp ||= new Promise((res, rej) => {
+    const r = indexedDB.open("reader", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("files");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+  const run = async (mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => {
+      const t = db.transaction("files", mode);
+      const req = fn(t.objectStore("files"));
+      t.oncomplete = () => res(req && "result" in req ? req.result : undefined);
+      t.onerror = t.onabort = () => rej(t.error);
+    });
+  };
+  return {
+    get: (k) => run("readonly", (s) => s.get(k)),
+    put: (k, v) => run("readwrite", (s) => s.put(v, k)),
+    del: (k) => run("readwrite", (s) => s.delete(k)),
+    keys: () => run("readonly", (s) => s.getAllKeys()),
+  };
+})();
+
+const DL_WINDOW = 3 * 3600;   // "next 3 hours"
+const offline = {
+  busy: {},          // bookId -> {done, total, label}
+  listeners: new Set(),
+  emit() { for (const f of this.listeners) try { f(); } catch {} },
+  mode: (id) => store.get(`dl:${id}`, "off"),
+  index: (id) => store.get(`dlx:${id}`, {}),            // {chapterIndex: bytes}
+  bytes(id) { return Object.values(this.index(id)).reduce((a, b) => a + b, 0); },
+  has(id, n) { return n in this.index(id); },
+  async setMode(id, m) {
+    store.set(`dl:${id}`, m);
+    if (m !== "off" && navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+    await this.sync(id);
+  },
+  async audioURL(id, n) {
+    if (!this.has(id, n)) return null;
+    const v = await idb.get(`/api/books/${id}/chapter-audio/${n}.m4a`).catch(() => null);
+    if (!v?.data) return null;
+    return URL.createObjectURL(v.data);
+  },
+  // which chapters should be on the phone right now
+  wanted(b, mode) {
+    const chs = b.chapters.filter((c) => c.include && c.n_units);
+    if (mode === "whole") return chs.map((c) => c.index);
+    if (mode !== "next") return [];
+    const pos = positions.best(b.id, b.position);
+    let i = Math.max(0, pos ? chs.findIndex((c) => c.index === pos.chapter) : 0), acc = 0;
+    const out = [];
+    for (; i < chs.length && acc < DL_WINDOW; i++) { out.push(chs[i].index); acc += chs[i].est; }
+    return out;
+  },
+  async drop(id, n) {
+    for (const k of [`/api/books/${id}/chapter-audio/${n}.m4a`, `/api/books/${id}/chapters/${n}`, `/api/books/${id}/chapters/${n}/timeline`]) await idb.del(k).catch(() => {});
+    const ix = this.index(id); delete ix[n]; store.set(`dlx:${id}`, ix);
+  },
+  async dropAll(id) { for (const n of Object.keys(this.index(id))) await this.drop(id, n); this.emit(); },
+  async sync(id) {
+    if (this.busy[id] || !navigator.onLine) return;
+    const mode = this.mode(id);
+    let b;
+    try { b = await api(`/api/books/${id}`); } catch { return; }
+    api("/api/books").catch(() => {});      // keep the library list on the phone too
+    const want = new Set(this.wanted(b, mode));
+    for (const n of Object.keys(this.index(id)).map(Number)) if (!want.has(n)) await this.drop(id, n);
+    const todo = b.chapters.filter((c) => want.has(c.index) && !this.has(id, c.index));
+    const ready = todo.filter((c) => c.full);
+    if (!ready.length) { this.emit(); return; }
+    this.busy[id] = { done: 0, total: ready.length, label: "" };
+    this.emit();
+    try {
+      if (!(await idb.get(`/api/books/${id}/cover`).catch(() => null))) {
+        const r = await fetch(`/api/books/${id}/cover`);
+        if (r.ok) await idb.put(`/api/books/${id}/cover`, { type: "blob", data: await r.blob() });
+      }
+      for (const c of ready) {
+        this.busy[id].label = c.title;
+        this.emit();
+        const base = `/api/books/${id}/chapters/${c.index}`;
+        const [cj, tl] = await Promise.all([fetch(base).then((r) => r.json()), fetch(`${base}/timeline`).then((r) => r.json())]);
+        const audio = await fetch(`/api/books/${id}/chapter-audio/${c.index}.m4a`).then((r) => { if (!r.ok) throw new Error(r.statusText); return r.blob(); });
+        await idb.put(base, { type: "json", data: cj });
+        await idb.put(`${base}/timeline`, { type: "json", data: tl });
+        await idb.put(`/api/books/${id}/chapter-audio/${c.index}.m4a`, { type: "blob", data: audio });
+        store.set(`dlx:${id}`, { ...this.index(id), [c.index]: audio.size });
+        this.busy[id].done++;
+        this.emit();
+      }
+    } catch (e) {
+      toast("Download paused: " + (e.message || "network"), 4000);
+    } finally { delete this.busy[id]; this.emit(); }
+  },
+  async syncAll() {
+    const ids = Object.keys(localStorage).filter((k) => k.startsWith("reader:dl:")).map((k) => k.slice(10));
+    for (const id of ids) if (this.mode(id) !== "off") await this.sync(id);
+  },
+};
+addEventListener("online", () => offline.syncAll());
+setInterval(() => offline.syncAll(), 10 * 60 * 1000);
+
 // ------------------------------------------------------------------ preferences (this device)
 const PREFS = { rewind: "normal", skip: 15, autoNext: true, highlight: "both", follow: true, wake: false };
 const prefs = new Proxy({}, {
@@ -111,6 +231,7 @@ const seg = (options, value, onpick) => h("div", { class: "segctl" }, options.ma
 // ------------------------------------------------------------------ header + renderer chip
 const ICON2 = {
   gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
+  phone: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 20h14"/></svg>',
   chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>',
   pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>',
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
@@ -189,6 +310,7 @@ async function viewLibrary() {
       h("div", { class: "grow" }, h("div", { class: "eyebrow" }, "Continue"), h("div", { class: "t" }, recent.title), h("div", { class: "muted" }, ch ? ch.title : "")),
       h("span", { class: "chev", html: ICON2.chev })));
   }
+  if (!navigator.onLine) main.append(h("div", { class: "offline-note" }, "You're offline · books on this phone still play"));
   main.append(h("div", { class: "lib-head" }, h("h1", {}, "Library"), books.length ? h("span", { class: "muted" }, `${books.length} book${books.length > 1 ? "s" : ""}`) : null));
   if (!books.length) {
     main.append(h("div", { class: "empty" }, h("h2", {}, "No books yet"), h("p", {}, "Drop an EPUB anywhere on this page, or use +."),
@@ -197,7 +319,9 @@ async function viewLibrary() {
     const grid = h("div", { class: "grid" });
     for (const b of books) {
       const p = b.progress || {};
-      grid.append(h("a", { class: "card", href: `#/book/${b.id}` }, coverEl(b),
+      const cv = coverEl(b);
+      if (offline.bytes(b.id)) cv.append(h("span", { class: "dl-badge", title: "On this phone", html: ICON2.phone }));
+      grid.append(h("a", { class: "card", href: `#/book/${b.id}` }, cv,
         h("div", {}, h("div", { class: "t" }, b.title), h("div", { class: "a" }, b.author)),
         h("div", { class: "bar", title: `${human(p.ready_est)} of ${human(p.total_est)} ready` },
           h("i", { class: "ready", style: `width:${pct(p.ready_est, p.total_est)}%` }),
@@ -232,11 +356,38 @@ async function viewBook(id) {
   const list = h("ul", { class: "chapters" });
   for (const c of playable) {
     const frac = c.n_segments ? c.ready / c.n_segments : 0;
-    list.append(h("li", { class: cur && c.index === cur.index ? "cur" : "" },
+    list.append(h("li", { class: cur && c.index === cur.index ? "cur" : "", "data-ch": c.index },
       h("a", { href: `#/read/${id}/${c.index}/0` }, h("span", { class: "ct" }, c.title),
-        h("span", { class: "state" }, frac >= 1 ? h("span", { class: "ok", html: ICON2.check }) : h("div", { class: "bar" }, h("i", { class: "ready", style: `width:${frac * 100}%` }))),
+        h("span", { class: "state" }, offline.has(id, c.index) ? h("span", { class: "ok phone", title: "On this phone", html: ICON2.phone })
+          : frac >= 1 ? h("span", { class: "ok", html: ICON2.check }) : h("div", { class: "bar" }, h("i", { class: "ready", style: `width:${frac * 100}%` }))),
         h("span", { class: "dur" }, human(c.est)))));
   }
+
+  const dlBox = h("section", { class: "card-box" });
+  const paintDl = () => {
+    if (dlBox.isConnected === false && dlBox.dataset.mounted) return offline.listeners.delete(paintDl);
+    const mode = offline.mode(id), busy = offline.busy[id], have = offline.index(id);
+    const n = Object.keys(have).length;
+    const waitingFor = offline.wanted(b, mode).filter((i) => !(i in have) && !b.chapters.find((c) => c.index === i)?.full).length;
+    const line = mode === "off" ? "Nothing on this phone yet"
+      : busy ? `Downloading ${busy.label} · ${busy.done + 1} of ${busy.total}`
+      : `${n} chapter${n === 1 ? "" : "s"} on this phone · ${bytes(offline.bytes(id))}` + (waitingFor ? ` · ${waitingFor} more when rendered` : "");
+    fill(dlBox, 
+      h("div", { class: "row-between stack" },
+        h("div", {}, h("div", { class: "label" }, "Download for offline"), h("div", { class: "muted small" }, line)),
+        seg([["off", "Off"], ["next", "Next 3 h"], ["whole", "Whole book"]], mode, async (v) => {
+          if (v === "off" && n && !confirm("Remove this book's downloads from this phone?")) return;
+          store.set(`dl:${id}`, v); paintDl(); await offline.setMode(id, v);
+        })),
+      busy ? h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(busy.done, busy.total)}%` })) : null);
+    for (const li of list.querySelectorAll("li[data-ch]")) {
+      const on = offline.has(id, +li.dataset.ch), st = li.querySelector(".state");
+      if (on && !st.querySelector(".phone")) fill(st, h("span", { class: "ok phone", title: "On this phone", html: ICON2.phone }));
+    }
+  };
+  offline.listeners.add(paintDl);
+  paintDl();
+  setTimeout(() => { dlBox.dataset.mounted = "1"; offline.sync(id); }, 0);
 
   const lang = h("select", { onchange: async () => {
     if (!confirm(`Read this book as ${b.langs[lang.value]}? Its audio will be rendered again from scratch.`)) { lang.value = b.lang; return; }
@@ -256,7 +407,7 @@ async function viewBook(id) {
       h("h1", {}, b.title), h("div", { class: "by" }, b.author),
       h("div", { class: "muted small" }, `${b.langs[b.lang]} · ${human(p.total_est)}` + (pos && cur ? ` · at ${cur.title}` : "")))),
     cur ? h("a", { class: "btn wide", href: `#/read/${id}/${cur.index}?play`, html: ICON.play + `<span>${pos ? "Continue" : "Start listening"}</span>` }) : null,
-    renderCard,
+    renderCard, dlBox,
     h("h2", { class: "section" }, "Chapters"), list,
     h("h2", { class: "section" }, "Book"), settingsBox);
   app.replaceChildren(top, main);
@@ -278,7 +429,7 @@ async function viewSystem() {
     if (!s) return;
     const w = s.worker, job = w.job, paused = s.settings.paused;
     const cur = job && s.queue.find((q) => q.id === job.book);
-    statusBox.replaceChildren(
+    fill(statusBox, 
       h("div", { class: "row-between" },
         h("div", {}, h("div", { class: "label big" }, h("span", { class: `dot ${paused ? "off" : w.state === "rendering" ? "on" : w.state === "error" ? "err" : "done"}` }),
           paused ? "Paused" : w.state === "rendering" ? "Rendering" : w.state === "error" ? "Something went wrong" : "Idle — nothing left to render"),
@@ -292,7 +443,7 @@ async function viewSystem() {
         h("div", {}, h("b", {}, cur && cur.eta != null ? eta(cur.eta) : "—"), h("span", {}, "to finish it"))),
       h("div", { class: "row-between stack top-gap" }, h("div", {}, h("div", { class: "label" }, "CPU for rendering"), h("div", { class: "muted small" }, "More is faster, but the laptop gets busier and warmer")),
         seg([[2, "Low"], [4, "Medium"], [8, "High"]], s.settings.threads, async (v) => { await api("/api/system", { method: "PUT", body: JSON.stringify({ threads: v }) }); paint(); })));
-    queueBox.replaceChildren(...(s.queue.length ? s.queue.map((q) => h("div", { class: "row-between" },
+    fill(queueBox, ...(s.queue.length ? s.queue.map((q) => h("div", { class: "row-between" },
       h("a", { class: "grow", href: `#/book/${q.id}` }, h("div", { class: "label" }, q.title),
         h("div", { class: "muted small" }, q.ready >= q.total - 1 ? `Fully rendered · ${human(q.total)}` : `${human(q.ready)} of ${human(q.total)} ready` + (q.render && q.eta != null ? ` · ${eta(q.eta)} to go` : q.render ? "" : " · off")),
         h("div", { class: "bar" }, h("i", { class: "ready", style: `width:${pct(q.ready, q.total)}%` }))),
@@ -300,7 +451,7 @@ async function viewSystem() {
       : [h("div", { class: "muted" }, "No books yet.")]));
   };
   const paintStorage = async () => {
-    storeBox.replaceChildren(h("div", { class: "muted small" }, "Measuring…"));
+    fill(storeBox, h("div", { class: "muted small" }, "Measuring…"));
     const st = await api("/api/storage").catch(() => null);
     if (!st) return;
     const rows = [h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Free space on the laptop"), h("div", { class: "muted small" }, `${bytes(st.disk_free)} free of ${bytes(st.disk_total)}`)))];
@@ -312,7 +463,7 @@ async function viewSystem() {
     rows.push(h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Sentence cache"),
       h("div", { class: "muted small" }, `${bytes(st.cache)} · ${st.cache_stale ? `${bytes(st.cache_stale)} no longer used` : "all in use"}`)),
       st.cache_stale ? h("button", { class: "btn ghost sm", onclick: async () => { const r = await api("/api/storage/clean", { method: "POST" }); toast(`Freed ${bytes(r.freed)}`); paintStorage(); } }, "Clean up") : null));
-    storeBox.replaceChildren(...rows);
+    fill(storeBox, ...rows);
   };
   clearInterval(sysTimer);
   sysTimer = setInterval(paint, 4000);
@@ -326,6 +477,16 @@ function viewSettings() {
   const top = topbar(back("#/", "Library"), h("div", { class: "page-title" }, "Settings"));
   const row = (label, hint, control) => h("div", { class: "row-between" + (control.classList.contains("segctl") ? " stack" : "") }, h("div", {}, h("div", { class: "label" }, label), hint ? h("div", { class: "muted small" }, hint) : null), control);
   const repaint = () => viewSettings();
+  const dlIds = Object.keys(localStorage).filter((k) => k.startsWith("reader:dlx:")).map((k) => k.slice(11));
+  const dlTotal = dlIds.reduce((a, id) => a + offline.bytes(id), 0);
+  const dlHint = h("div", { class: "muted small" }, dlTotal ? `${bytes(dlTotal)} of downloaded audio` : "Nothing downloaded");
+  navigator.storage?.estimate?.().then((e) => { if (e.quota) dlHint.textContent += ` · room for about ${bytes(Math.max(0, e.quota - e.usage))} more`; }).catch(() => {});
+  const dlRow = h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Downloads"), dlHint),
+    dlTotal ? h("button", { class: "btn ghost sm", onclick: async () => {
+      if (!confirm("Remove all downloaded books from this phone? Your place in each book is kept.")) return;
+      for (const id of dlIds) { store.set(`dl:${id}`, "off"); await offline.dropAll(id); }
+      toast("Downloads removed"); repaint();
+    } }, "Remove all") : null);
   const main = h("main", { class: "wrap narrow" },
     h("h2", { class: "section" }, "Listening"),
     h("section", { class: "card-box rows" },
@@ -339,6 +500,8 @@ function viewSettings() {
       row("Keep the screen on", "While listening with the text open", switchEl(prefs.wake, (v) => { prefs.wake = v; repaint(); })),
       row("Text size", null, seg([17, 19, 21, 23, 26].map((z) => [z, String(z)]), store.get("size", 21), (v) => { store.set("size", v); applyLook(); repaint(); })),
       row("Theme", null, seg([["auto", "Auto"], ["light", "Light"], ["sepia", "Sepia"], ["dark", "Dark"], ["black", "Black"]], store.get("theme", "auto"), (v) => { store.set("theme", v); applyLook(); repaint(); }))),
+    h("h2", { class: "section" }, "This phone"),
+    h("section", { class: "card-box rows" }, dlRow),
     h("h2", { class: "section" }, "Rendering"),
     h("section", { class: "card-box rows" }, h("a", { class: "row-between", href: "#/system" }, h("div", {}, h("div", { class: "label" }, "Rendering & storage"), h("div", { class: "muted small" }, "Progress, pause, CPU use, disk space")), h("span", { class: "chev", html: ICON2.chev }))),
     h("p", { class: "muted small center" }, "Preferences on this page are saved on this device."));
@@ -409,7 +572,9 @@ const player = {
     const ch = this.ch;
     if (ch.full) {
       const tl = await api(`/api/books/${this.book.id}/chapters/${ch.index}/timeline`);
-      this.pieces = [{ url: `/api/books/${this.book.id}/chapter-audio/${ch.index}.m4a`, start: 0, dur: tl.duration, tl, ready: true }];
+      if (this.localURL) URL.revokeObjectURL(this.localURL);
+      this.localURL = await offline.audioURL(this.book.id, ch.index);        // on the phone: no data, no buffering
+      this.pieces = [{ url: this.localURL || `/api/books/${this.book.id}/chapter-audio/${ch.index}.m4a`, start: 0, dur: tl.duration, tl, ready: true }];
       tl.units.forEach((u) => this.wordify(u, 0));
     } else {
       let start = 0;
@@ -680,6 +845,7 @@ const player = {
   },
   showWaiting(p) {
     const w = this.$.status;
+    if (!navigator.onLine) { w.replaceChildren(h("span", { class: "waiting" }, "You're offline and this part isn't downloaded")); return; }
     const rate = this.lastRate || 1.2;
     const secs = Math.max(10, Math.round((p.dur || 60) / rate));
     w.replaceChildren(h("span", { class: "waiting" }, h("span", { class: "spinner" }), `Rendering this part · about ${secs < 60 ? secs + " s" : Math.round(secs / 60) + " min"}`));
@@ -713,6 +879,7 @@ const player = {
     if (n >= 0 && n + 1 < chs.length) {
       positions.remember(this.book.id, { chapter: chs[n + 1].index, unit: 0, t: 0 });
       positions.push(this.book.id);
+      setTimeout(() => offline.sync(this.book.id), 5000);
       location.hash = `#/read/${this.book.id}/${chs[n + 1].index}/0?play`;
     } else { this.setPlayIcon(true); toast("The end."); }
   },
@@ -859,5 +1026,6 @@ async function route() {
 }
 addEventListener("hashchange", route);
 route();
+setTimeout(() => offline.syncAll(), 3000);
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});

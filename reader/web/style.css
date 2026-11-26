@@ -248,3 +248,7 @@ h2.section { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em
   .chapters a { grid-template-columns: 1fr 2.5rem 5.5rem; gap: .6rem; }
   .chapters .state { display: block; }
 }
+.dl-badge { position: absolute; right: 6px; bottom: 6px; width: 26px; height: 26px; border-radius: 50%; background: rgba(0,0,0,.55); color: #fff; display: grid; place-items: center; }
+.dl-badge svg { width: 15px; height: 15px; }
+.chapters .ok.phone { color: var(--accent); }
+.offline-note { margin: 1.25rem 0 0; padding: .6rem .9rem; border-radius: 10px; background: var(--hl); font-size: .9rem; }

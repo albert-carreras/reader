@@ -214,6 +214,8 @@ def get_book(book_id: str):
     for c in m["chapters"]:
         st = lib.chapter_status(book_id, c["index"], c["n_segments"])
         c["ready"] = sum(st)
+        c["full"] = lib.chapter_file_ready(book_id, c["index"])        # downloadable for offline
+        c["bytes"] = (lib.audio_dir(book_id, c["index"]) / "full.m4a").stat().st_size if c["full"] else 0
     m["position"] = lib.position(book_id)
     m["progress"] = lib.progress(m)
     m["voices"] = VOICES.get(m["lang"], VOICES["en"])

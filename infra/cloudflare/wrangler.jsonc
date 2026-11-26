@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "reader-edge",
+  "account_id": "17ef3b088f7d0af621420d0313ff4d39",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-26",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "reader.bored.cat",
+      "custom_domain": true
+    }
+  ],
+  "vpc_networks": [
+    {
+      "binding": "READER_ORIGIN",
+      "tunnel_id": "TUNNEL_ID",
+      "remote": true
+    }
+  ]
+}

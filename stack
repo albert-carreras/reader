@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# reader ops on au.
+#   ./stack local      run in the foreground (ctrl-c stops)
+#   ./stack install    install + start the systemd user service (once)
+#   ./stack deploy     git pull -> uv sync -> restart
+#   ./stack status     service + connector status, local health
+#   ./stack logs       follow the app journal
+#   ./stack edge       deploy the Cloudflare Worker (infra/cloudflare)
+set -euo pipefail
+cd "$(dirname "$0")"
+SVC=reader
+health() { curl -fsS --max-time 5 http://127.0.0.1:8130/healthz && echo; }
+case "${1:-}" in
+  local)   exec uv run python -m reader.server ;;
+  install)
+    mkdir -p ~/.config/systemd/user ~/.config/reader
+    [[ -f ~/.config/reader/env ]] || printf 'READER_ACCESS_TEAM=bertini.cloudflareaccess.com\nREADER_ACCESS_AUD=\nREADER_THREADS=4\nREADER_NICE=10\n' > ~/.config/reader/env
+    cp infra/systemd/reader.service ~/.config/systemd/user/reader.service
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$SVC"
+    sleep 4; health ;;
+  deploy)
+    git pull --ff-only
+    uv sync --frozen --no-dev
+    cp infra/systemd/reader.service ~/.config/systemd/user/reader.service
+    systemctl --user daemon-reload
+    systemctl --user restart "$SVC"
+    for _ in $(seq 1 30); do health 2>/dev/null && exit 0; sleep 1; done
+    echo "app did not come up" >&2; exit 1 ;;
+  status)
+    systemctl --user --no-pager status "$SVC" | head -5 || true
+    systemctl --no-pager status cloudflared-reader 2>/dev/null | head -3 || true
+    health || true
+    curl -sS -o /dev/null -w 'https://reader.bored.cat/healthz -> %{http_code}\n' --max-time 10 https://reader.bored.cat/healthz || true ;;
+  logs)    journalctl --user -u "$SVC" -f ;;
+  edge)    npx -y wrangler@latest deploy -c infra/cloudflare/wrangler.jsonc ;;
+  *)       sed -n '2,9p' "$0"; exit 1 ;;
+esac

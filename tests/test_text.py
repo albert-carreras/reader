@@ -1,0 +1,78 @@
+"""Regression cases for 'any page': what the narrator must say for tricky book text.
+
+Run: uv run pytest -q
+"""
+import pytest
+
+from reader.book import Block, Chapter
+from reader.segment import units
+from reader.textnorm import speak
+
+ES = [
+    ("En el siglo XIX, Felipe II y Carlos III reinaron.", "En el siglo diecinueve, Felipe segundo y Carlos tercero reinaron."),
+    ("Llegó el 3 de mayo de 1808 a las 7:30.", "Llegó el tres de mayo de mil ochocientos ocho a las siete y media."),
+    ("El Sr. Villalba y D. Ramón.", "El señor Villalba y Don Ramón."),
+    ("Era el 1.º de la clase y la 2.ª en llegar.", "Era el primero de la clase y la segunda en llegar."),
+    ("La guerra (1914-1918) fue larga.", "La guerra, mil novecientos catorce a mil novecientos dieciocho, fue larga."),
+    ("Ud. y Uds. lo sabían.", "usted y ustedes lo sabían."),
+    ("Leyó el capítulo IV.", "Leyó el capítulo cuatro."),
+    ("Iba á pesar de todo, é hizo lo que pudo.", "Iba a pesar de todo, e hizo lo que pudo."),
+    ("Había recorrido 1.200 kilómetros.", "Había recorrido mil doscientos kilómetros."),
+]
+EN = [
+    ("On May 3rd, 1808, at 7:30 p.m.", "On may third, eighteen oh eight, at seven thirty PM"),
+    ("Henry VIII met Louis XIV.", "Henry the eighth met Louis the fourteenth."),
+    ("Mr. and Mrs. Smith met Dr. Jones.", "mister and misses Smith met doctor Jones."),
+    ("World War II ended in 1945.", "World War two ended in nineteen forty five."),
+    ("Read Chapter XII tonight.", "Read Chapter twelve tonight."),
+    ("It was—as she knew—too late.", "It was, as she knew, too late."),
+]
+HEADINGS = [
+    ("I. Perdido.", "es", "Capítulo uno. Perdido."),
+    ("IV", "en", "Chapter four"),
+    ("Stave I. Marley’s Ghost", "en", "Stave one. Marley's Ghost"),
+    ("CAPÍTULO PRIMERO", "es", "Capítulo primero"),
+]
+
+
+@pytest.mark.parametrize("text,want", ES)
+def test_es(text, want):
+    assert speak(text, "es") == want
+
+
+@pytest.mark.parametrize("text,want", EN)
+def test_en(text, want):
+    assert speak(text, "en") == want
+
+
+@pytest.mark.parametrize("text,lang,want", HEADINGS)
+def test_headings(text, lang, want):
+    assert speak(text, lang, heading=True).replace("’", "'") == want
+
+
+def _units(text, lang):
+    return [(u.role, u.kind, u.spoken) for u in units(Chapter(1, "t", "t", "body", [Block("para", text)]), lang)]
+
+
+def test_raya_dialogue_unspaced():
+    got = _units("—No puedo equivocarme—murmuró.—Me dijeron que sí.", "es")
+    assert [r for r, *_ in got] == ["speech", "tag", "speech"]
+    assert got[0][2] == "No puedo equivocarme," and got[1][2] == "murmuró."
+
+
+def test_raya_dialogue_spaced():
+    got = _units("—¿Vienes? —preguntó ella—. No tardes.", "es")
+    assert [(r, k) for r, k, _ in got] == [("speech", "yesno"), ("tag", "statement"), ("speech", "statement")]
+
+
+def test_wh_vs_yesno():
+    kinds = [k for _, k, _ in _units("—¿En dónde estás? ¿Pero qué más da? ¿Te acobardarás ahora?", "es")]
+    assert kinds == ["wh", "wh", "yesno"]
+    kinds = [k for _, k, _ in _units("“What right have you to be merry? Is there another one?”", "en")]
+    assert kinds == ["wh", "yesno"]
+
+
+def test_quote_tag_keeps_sentence_open():
+    got = _units("“And what is the use of a book,” thought Alice “without pictures or conversations?”", "en")
+    assert got[1] == ("tag", "continuation", "thought Alice,")
+    assert got[2][1] == "yesno"

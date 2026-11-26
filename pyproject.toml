@@ -1,0 +1,45 @@
+[project]
+name = "reader"
+version = "0.1.0"
+description = "Self-hosted read-along audiobooks: EPUB -> natural narration (Phonon) with sentence/word timing"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "ebooklib>=0.18",
+    "lxml>=5",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "ptts",                 # Phonon TTS runtime (CPU)
+    "zyphra-textnorm",      # NeMo text-normalization grammars (numbers, dates, roman numerals, abbreviations)
+    "pysbd",                # sentence boundary detection (en/es)
+    # verification ASR
+    "praat-parselmouth",    # pitch tracking for intonation scoring
+    "torch==2.8.*",
+    "torchaudio==2.8.*",
+    "unidecode>=1.4.0",
+    "fastapi>=0.165.0",
+    "uvicorn[standard]>=0.54.0",
+    "python-multipart>=0.0.34",
+    "pyjwt[crypto]>=2.15.1",
+]
+
+[project.scripts]
+reader = "reader.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

@@ -1,0 +1,24 @@
+# reader — web app + background renderer, one process, on 127.0.0.1:8130.
+# systemd *user* service: ./stack install copies it to ~/.config/systemd/user/ (linger is enabled).
+[Unit]
+Description=reader — read-along audiobooks (web app + renderer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/reader
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONWARNINGS=ignore
+# READER_ACCESS_TEAM / READER_ACCESS_AUD / READER_THREADS / READER_NICE live here (not committed)
+EnvironmentFile=-%h/.config/reader/env
+ExecStart=%h/.local/bin/uv run --no-sync python -m reader.server
+Restart=always
+RestartSec=5
+# rendering is background work: keep the laptop responsive
+Nice=5
+CPUWeight=50
+
+[Install]
+WantedBy=default.target

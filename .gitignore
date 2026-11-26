@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+books/
+testbooks/
+renders*/
+share/
+bakeoff/
+attic/
+*.wav
+*.m4a
+.wrangler/

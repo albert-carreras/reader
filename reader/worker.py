@@ -184,9 +184,10 @@ class Worker(threading.Thread):
         self.build_chapter(m, chap)
         took = time.time() - t0
         self.status["rendered_secs"] += tl["duration"]
-        if took > 1:
-            r = tl["duration"] / took
-            self.status["rate"] = round(r if self.status["rate"] is None else 0.7 * self.status["rate"] + 0.3 * r, 2)
+        # speed = audio rendered / wall time over the last 15 minutes (one slow segment no longer swings it)
+        now = time.time()
+        self._window = [(t, a, w) for t, a, w in getattr(self, "_window", []) if now - t < 900] + [(now, tl["duration"], took)]
+        self.status["rate"] = round(sum(a for _, a, _ in self._window) / max(sum(w for *_, w in self._window), 1e-6), 2)
 
     def build_chapter(self, m: dict, chap: dict) -> None:
         """Once every segment exists, join them into one continuous chapter file (no hand-offs while listening)."""

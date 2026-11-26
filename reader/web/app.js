@@ -49,6 +49,8 @@ const fmt = (s) => {
 };
 const human = (s) => { s = Math.round(s || 0); const hh = Math.floor(s / 3600), mm = Math.round((s % 3600) / 60); return hh ? `${hh} h ${mm} min` : `${mm} min`; };
 const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k != null && k !== false));
+const NUMERAL = /^([IVXLCDM]+|\d+)\.?$/i;
+const chapterLabel = (title, lang) => (NUMERAL.test((title || "").trim()) ? `${lang === "es" ? "Capítulo" : "Chapter"} ${title.trim().replace(/\.$/, "")}` : title);
 const toast = (msg, ms = 2800) => { const t = h("div", { class: "toast" }, msg); document.body.append(t); setTimeout(() => t.remove(), ms); };
 const store = {
   get: (k, d) => { try { return JSON.parse(localStorage.getItem("reader:" + k)) ?? d; } catch { return d; } },
@@ -75,6 +77,10 @@ const realPlaying = () => !audio.paused;
 
 // theme & text size
 const applyLook = () => {
+  requestAnimationFrame(() => {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+    document.querySelectorAll('meta[name="theme-color"]').forEach((m) => m.setAttribute("content", bg));
+  });
   const theme = store.get("theme", "auto");
   if (theme === "auto") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", theme);
@@ -261,15 +267,18 @@ const renderChip = () => {
   tick(true);
   return chip;
 };
-const topbar = (left, ...right) => h("header", { class: "top" }, h("div", { class: "wrap" }, left, h("div", { class: "grow" }), ...right));
+const topbar = (left, center, ...right) => h("header", { class: "top" }, h("div", { class: "wrap" }, left, center || h("div", { class: "grow" }), ...right));
 const brand = () => h("a", { class: "brand", href: "#/" }, h("i"), "reader");
 const back = (href, title) => h("a", { class: "iconbtn", href, title, html: ICON.back });
 const gear = () => h("a", { class: "iconbtn", href: "#/settings", title: "Settings", html: ICON2.gear });
 
 // ------------------------------------------------------------------ upload
+const importing = new Map();     // job id -> {name, state}
 const upload = async (file) => {
-  if (!file || !/\.epub$/i.test(file.name)) return toast("That isn't an .epub file");
-  toast(`Importing “${file.name}”…`, 8000);
+  if (!file || !/\.epub$/i.test(file.name)) return toast("That isn't an EPUB file");
+  const temp = "t" + Date.now();
+  importing.set(temp, { name: file.name.replace(/\.epub$/i, "") });
+  if (!location.hash || location.hash === "#/") viewLibrary(); else toast(`Adding “${file.name.replace(/\.epub$/i, "")}”…`);
   const fd = new FormData();
   fd.append("file", file);
   try {
@@ -281,8 +290,13 @@ const upload = async (file) => {
       job = await api(`/api/imports/${job.id}`);
     }
     if (job.state === "error") throw new Error(job.error);
+    importing.delete(temp);
     location.hash = `#/book/${job.book}`;
-  } catch (e) { toast("Import failed: " + e.message, 6000); }
+  } catch (e) {
+    importing.delete(temp);
+    if (!location.hash || location.hash === "#/") viewLibrary();
+    toast(`Couldn't add “${file.name}”: ${e.message}`, 6000);
+  }
 };
 const picker = () => {
   const inp = h("input", { type: "file", accept: ".epub,application/epub+zip", hidden: true, onchange: () => upload(inp.files[0]) });
@@ -300,23 +314,25 @@ addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; $("#drop").
 async function viewLibrary() {
   player.detach();
   const books = await api("/api/books");
-  const top = topbar(brand(), renderChip(), gear(), h("button", { class: "iconbtn add", title: "Add book", onclick: picker, html: ICON.plus }));
+  const top = topbar(brand(), null, renderChip(), gear(), h("button", { class: "iconbtn add", title: "Add book", onclick: picker, html: ICON.plus }));
   const main = h("main", { class: "wrap" });
   const recent = books.find((b) => positions.best(b.id, b.position));
   if (recent) {
     const pos = positions.best(recent.id, recent.position);
     const ch = recent.chapters.find((c) => c.index === pos.chapter);
     main.append(h("a", { class: "continue", href: `#/read/${recent.id}/${pos.chapter}?play` }, coverEl(recent),
-      h("div", { class: "grow" }, h("div", { class: "eyebrow" }, "Continue"), h("div", { class: "t" }, recent.title), h("div", { class: "muted" }, ch ? ch.title : "")),
+      h("div", { class: "grow" }, h("div", { class: "eyebrow" }, "Continue"), h("div", { class: "t" }, recent.title), h("div", { class: "muted" }, ch ? chapterLabel(ch.title, recent.lang) : "")),
       h("span", { class: "chev", html: ICON2.chev })));
   }
   if (!navigator.onLine) main.append(h("div", { class: "offline-note" }, "You're offline · books on this phone still play"));
   main.append(h("div", { class: "lib-head" }, h("h1", {}, "Library"), books.length ? h("span", { class: "muted" }, `${books.length} book${books.length > 1 ? "s" : ""}`) : null));
-  if (!books.length) {
+  if (!books.length && !importing.size) {
     main.append(h("div", { class: "empty" }, h("h2", {}, "No books yet"), h("p", {}, "Drop an EPUB anywhere on this page, or use +."),
       h("button", { class: "btn", onclick: picker }, "Choose an EPUB")));
   } else {
     const grid = h("div", { class: "grid" });
+    for (const [, it] of importing) grid.append(h("div", { class: "card importing" }, h("div", { class: "cover" }, h("span", { class: "spinner" }), "Adding book…"),
+      h("div", {}, h("div", { class: "t" }, it.name))));
     for (const b of books) {
       const p = b.progress || {};
       const cv = coverEl(b);
@@ -341,7 +357,7 @@ async function viewBook(id) {
   const cur = (pos && b.chapters.find((c) => c.index === pos.chapter)) || playable.find((c) => c.include);
   const p = b.progress;
   const done = p.ready_est >= p.total_est - 1;
-  const top = topbar(back("#/", "Library"), renderChip(), gear());
+  const top = topbar(back("#/", "Library"), null, renderChip(), gear());
 
   const state = !b.render ? ["off", "Rendering is off for this book"] : done ? ["done", "Fully rendered"]
     : b.rendering_now ? ["on", "Rendering now"] : ["queued", "Queued"];
@@ -357,7 +373,7 @@ async function viewBook(id) {
   for (const c of playable) {
     const frac = c.n_segments ? c.ready / c.n_segments : 0;
     list.append(h("li", { class: cur && c.index === cur.index ? "cur" : "", "data-ch": c.index },
-      h("a", { href: `#/read/${id}/${c.index}/0` }, h("span", { class: "ct" }, c.title),
+      h("a", { href: `#/read/${id}/${c.index}/0` }, h("span", { class: "ct" }, chapterLabel(c.title, b.lang)),
         h("span", { class: "state" }, offline.has(id, c.index) ? h("span", { class: "ok phone", title: "On this phone", html: ICON2.phone })
           : frac >= 1 ? h("span", { class: "ok", html: ICON2.check }) : h("div", { class: "bar" }, h("i", { class: "ready", style: `width:${frac * 100}%` }))),
         h("span", { class: "dur" }, human(c.est)))));
@@ -405,7 +421,7 @@ async function viewBook(id) {
   const main = h("main", { class: "wrap narrow" },
     h("section", { class: "book-hero" }, coverEl(b), h("div", {},
       h("h1", {}, b.title), h("div", { class: "by" }, b.author),
-      h("div", { class: "muted small" }, `${b.langs[b.lang]} · ${human(p.total_est)}` + (pos && cur ? ` · at ${cur.title}` : "")))),
+      h("div", { class: "muted small" }, `${b.langs[b.lang]} · ${human(p.total_est)}` + (pos && cur ? ` · at ${chapterLabel(cur.title, b.lang)}` : "")))),
     cur ? h("a", { class: "btn wide", href: `#/read/${id}/${cur.index}?play`, html: ICON.play + `<span>${pos ? "Continue" : "Start listening"}</span>` }) : null,
     renderCard, dlBox,
     h("h2", { class: "section" }, "Chapters"), list,
@@ -438,9 +454,9 @@ async function viewSystem() {
         h("button", { class: "btn sm" + (paused ? "" : " ghost"), onclick: async () => { await api("/api/system", { method: "PUT", body: JSON.stringify({ paused: !paused }) }); paint(); } }, paused ? "Resume" : "Pause all")),
       cur ? h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(cur.ready, cur.total)}%` })) : null,
       h("div", { class: "stats" },
-        h("div", {}, h("b", {}, w.rate ? `${w.rate.toFixed(1)}×` : "—"), h("span", {}, "speed (realtime)")),
-        h("div", {}, h("b", {}, cur ? `${pct(cur.ready, cur.total)}%` : "—"), h("span", {}, "of this book ready")),
-        h("div", {}, h("b", {}, cur && cur.eta != null ? eta(cur.eta) : "—"), h("span", {}, "to finish it"))),
+        h("div", {}, h("b", {}, w.rate ? `${w.rate.toFixed(1)}×` : "—"), h("span", {}, "realtime speed")),
+        h("div", {}, h("b", {}, cur ? `${pct(cur.ready, cur.total)}%` : "—"), h("span", {}, "book ready")),
+        h("div", {}, h("b", {}, cur && cur.eta != null ? eta(cur.eta) : "—"), h("span", {}, "left"))),
       h("div", { class: "row-between stack top-gap" }, h("div", {}, h("div", { class: "label" }, "CPU for rendering"), h("div", { class: "muted small" }, "More is faster, but the laptop gets busier and warmer")),
         seg([[2, "Low"], [4, "Medium"], [8, "High"]], s.settings.threads, async (v) => { await api("/api/system", { method: "PUT", body: JSON.stringify({ threads: v }) }); paint(); })));
     fill(queueBox, ...(s.queue.length ? s.queue.map((q) => h("div", { class: "row-between" },
@@ -474,7 +490,7 @@ async function viewSystem() {
 // ------------------------------------------------------------------ settings
 function viewSettings() {
   player.detach();
-  const top = topbar(back("#/", "Library"), h("div", { class: "page-title" }, "Settings"));
+  const top = topbar(back("#/", "Library"), h("div", { class: "page-title" }, "Settings"), h("span", { class: "iconbtn", "aria-hidden": "true" }));
   const row = (label, hint, control) => h("div", { class: "row-between" + (control.classList.contains("segctl") ? " stack" : "") }, h("div", {}, h("div", { class: "label" }, label), hint ? h("div", { class: "muted small" }, hint) : null), control);
   const repaint = () => viewSettings();
   const dlIds = Object.keys(localStorage).filter((k) => k.startsWith("reader:dlx:")).map((k) => k.slice(11));
@@ -525,8 +541,10 @@ const player = {
   waiting: null, stoppedAt: 0, raf: 0, root: null, loading: false, retry: 0, retryTimer: 0, userPaused: true,
 
   detach() {
+    document.body.classList.remove("has-player");
     audio.pause();
     this.wake(false);
+    removeEventListener("scroll", this.onScroll);
     cancelAnimationFrame(this.raf);
     clearTimeout(this.waiting); clearTimeout(this.retryTimer);
     this.waiting = null;
@@ -535,6 +553,7 @@ const player = {
 
   async open(bookId, chIndex, unit, autoplay) {
     this.detach();
+    document.body.classList.add("has-player");
     this.follow = prefs.follow;
     const [b, ch] = await Promise.all([api(`/api/books/${bookId}`), api(`/api/books/${bookId}/chapters/${chIndex}`)]);
     this.book = b; this.ch = ch; this.cur = -1; this.curWord = null; this.piece = -1;
@@ -656,13 +675,11 @@ const player = {
   // ---------- DOM
   render() {
     const b = this.book, ch = this.ch;
-    const top = h("header", { class: "top" }, h("div", { class: "wrap" },
+    const top = h("header", { class: "top reader-top" }, h("div", { class: "wrap" },
       h("a", { class: "iconbtn", href: `#/book/${b.id}`, title: b.title, html: ICON.back }),
-      h("div", { class: "grow", style: "overflow:hidden" }, h("div", { style: "font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" }, ch.title),
-        h("div", { class: "muted", style: "font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" }, b.title)),
-      h("button", { class: "iconbtn", title: "Chapters", html: ICON.list, onclick: (e) => this.sheet("chapters", e) }),
+      h("div", { class: "titles" }, h("div", { class: "kicker" }, b.title), h("div", { class: "ttl" }, chapterLabel(ch.title, b.lang))),
       h("button", { class: "iconbtn", title: "Text", html: ICON.type, onclick: (e) => this.sheet("look", e) })));
-
+    this.$top = top;
     const page = h("article", { class: "page", lang: b.lang, "data-hl": prefs.highlight });
     const byBlock = new Map();
     ch.units.forEach((u) => { if (!byBlock.has(u.block)) byBlock.set(u.block, []); byBlock.get(u.block).push(u); });
@@ -694,23 +711,41 @@ const player = {
     });
 
     this.$ = {};
-    const scrub = h("div", { class: "scrub", title: "Seek", onclick: (e) => this.scrubTo(e) },
-      this.$.track = h("div", { class: "track" }), this.$.knob = h("div", { class: "knob" }));
-    this.$.play = h("button", { class: "play", title: "Play (space)", html: ICON.play, onclick: () => { this.toggle(); } });
-    const ctrl = (icon, title, fn) => h("button", { class: "iconbtn", title, html: icon, onclick: fn });
-    this.$.speed = h("button", { class: "chip", title: "Playback speed", onclick: (e) => this.sheet("speed", e) });
-    this.$.times = h("div", { class: "times" });
-    this.$.status = h("div", { class: "status" });
-    const bar = h("div", { class: "player" }, scrub,
-      h("div", { class: "row" }, this.$.times,
-        h("div", { class: "ctrls" }, ctrl(skipIcon(-1), `Back ${prefs.skip} s (shift ←)`, () => this.skip(-1)), ctrl(ICON.prev, "Previous sentence (←)", () => this.step(-1)),
-          this.$.play, ctrl(ICON.next, "Next sentence (→)", () => this.step(1)), ctrl(skipIcon(1), `Forward ${prefs.skip} s (shift →)`, () => this.skip(1))),
-        h("div", { class: "right" }, this.$.speed)),
-      this.$.status);
-    this.$.follow = h("button", { class: "follow", hidden: true, onclick: () => { this.follow = true; this.$.follow.hidden = true; this.scrollToCur(true); } }, "↓ Back to narrator");
+    this.$.track = h("div", { class: "track" });
+    this.$.knob = h("div", { class: "knob" });
+    this.$.tip = h("div", { class: "tip", hidden: true });
+    const scrub = h("div", { class: "scrub", role: "slider", "aria-label": "Position in chapter" }, this.$.track, this.$.knob, this.$.tip);
+    this.bindScrub(scrub);
+    this.$.elapsed = h("span");
+    this.$.remain = h("span");
+    this.$.play = h("button", { class: "play", title: "Play (space)", html: ICON.play, onclick: () => this.toggle() });
+    const ctrl = (icon, title, fn, cls = "") => h("button", { class: "iconbtn " + cls, title, "aria-label": title, html: icon, onclick: fn });
+    this.$.speed = h("button", { class: "speedbtn", title: "Playback speed", onclick: (e) => this.sheet("speed", e) });
+    this.$.status = h("div", { class: "float-status" });
+    const bar = h("div", { class: "player" },
+      scrub, h("div", { class: "times" }, this.$.elapsed, this.$.remain),
+      h("div", { class: "ctrls" },
+        this.$.speed,
+        ctrl(skipIcon(-1), `Back ${prefs.skip} s`, () => this.skip(-1)),
+        ctrl(ICON.prev, "Previous sentence", () => this.step(-1), "sm"),
+        this.$.play,
+        ctrl(ICON.next, "Next sentence", () => this.step(1), "sm"),
+        ctrl(skipIcon(1), `Forward ${prefs.skip} s`, () => this.skip(1)),
+        ctrl(ICON.list, "Chapters", (e) => this.sheet("chapters", e))));
+    this.$.follow = h("button", { class: "follow", hidden: true, onclick: () => { this.follow = true; this.$.follow.hidden = true; this.scrollToCur(true); } }, "Back to narrator");
     const main = h("main", { class: "reader" }, page);
     this.root = main;
-    app.replaceChildren(top, main, this.$.follow, bar);
+    app.replaceChildren(top, main, this.$.follow, this.$.status, bar);
+    // the header gets out of the way while reading down, and comes back when scrolling up
+    let lastY = scrollY;
+    removeEventListener("scroll", this.onScroll);
+    this.onScroll = () => {
+      const y = scrollY;
+      if (y > lastY + 4 && y > 120) top.classList.add("hide");
+      else if (y < lastY - 4 || y < 60) top.classList.remove("hide");
+      lastY = y;
+    };
+    addEventListener("scroll", this.onScroll, { passive: true });
     const stopFollow = () => { if (!audio.paused && prefs.follow) { this.follow = false; this.$.follow.hidden = false; } };
     main.addEventListener("wheel", stopFollow, { passive: true });
     main.addEventListener("touchmove", stopFollow, { passive: true });
@@ -719,10 +754,10 @@ const player = {
   sheet(kind, ev) {
     ev.stopPropagation();
     document.querySelector(".sheet")?.remove();
-    const s = h("div", { class: "sheet" + (kind === "speed" ? " bottom" : ""), onclick: (e) => e.stopPropagation() });
+    const s = h("div", { class: "sheet" + (kind === "speed" || kind === "chapters" ? " bottom" : ""), onclick: (e) => e.stopPropagation() });
     if (kind === "chapters") {
       s.append(h("h3", {}, "Chapters"), h("div", { class: "list" }, this.book.chapters.filter((c) => c.n_units).map((c) =>
-        h("a", { href: `#/read/${this.book.id}/${c.index}/0`, class: c.index === this.ch.index ? "on" : "" }, c.title, h("span", { class: "muted" }, "  ~" + human(c.est))))));
+        h("a", { href: `#/read/${this.book.id}/${c.index}/0`, class: c.index === this.ch.index ? "on" : "" }, h("span", {}, chapterLabel(c.title, this.book.lang)), h("span", { class: "muted" }, human(c.est))))));
     } else if (kind === "speed") {
       const val = h("div", { class: "speed-val" });
       const slider = h("input", { type: "range", min: "0.5", max: "2.5", step: "0.05", value: String(audio.playbackRate), class: "speed-slider",
@@ -770,7 +805,7 @@ const player = {
     audio.playbackRate = v;
     audio.defaultPlaybackRate = v;
     if (this.book) store.set(`speed:${this.book.id}`, v);
-    if (this.$?.speed) this.$.speed.textContent = v === 1 ? "1×" : `${v}×`;
+    if (this.$?.speed) this.$.speed.textContent = `${v}×`;
     this.positionState();
   },
   playUnit(i) { return this.seek(this.timeOfUnit(i), true, i); },
@@ -933,12 +968,39 @@ const player = {
     tick();
   },
   paintTime() {
-    if (!this.$?.times) return;
-    const total = this.chapterTotal(), t = this.chapterTime(), rate = audio.playbackRate || 1;
+    if (!this.$?.elapsed) return;
+    const total = this.chapterTotal(), rate = audio.playbackRate || 1;
+    const t = this.dragT ?? this.chapterTime();
     const exact = this.pieces.every((p) => p.tl);
-    this.$.times.textContent = `${fmt(t / rate)} / ${exact ? "" : "~"}${fmt(total / rate)}`;
-    this.$.knob.style.left = `${(100 * t) / Math.max(total, 1)}%`;
-    if (this.$.played) this.$.played.style.width = `${(100 * t) / Math.max(total, 1)}%`;
+    this.$.elapsed.textContent = fmt(t / rate);
+    this.$.remain.textContent = `−${exact ? "" : "~"}${fmt(Math.max(0, total - t) / rate)}`;
+    const f = Math.min(1, t / Math.max(total, 1));
+    this.$.knob.style.left = `${100 * f}%`;
+    if (this.$.played) this.$.played.style.width = `${100 * f}%`;
+  },
+  // drag (or tap) the scrubber: preview while moving, seek on release, keep playing/paused as it was
+  bindScrub(el) {
+    const at = (e) => { const r = el.getBoundingClientRect(); return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * this.chapterTotal(); };
+    const tip = () => {
+      this.$.tip.textContent = fmt(this.dragT / (audio.playbackRate || 1));
+      this.$.tip.style.left = `${(100 * this.dragT) / Math.max(this.chapterTotal(), 1)}%`;
+    };
+    el.addEventListener("pointerdown", (e) => {
+      el.setPointerCapture(e.pointerId);
+      el.classList.add("drag");
+      this.dragT = at(e); this.$.tip.hidden = false; tip(); this.paintTime();
+    });
+    el.addEventListener("pointermove", (e) => { if (this.dragT == null) return; this.dragT = at(e); tip(); this.paintTime(); });
+    const stop = (commit) => {
+      if (this.dragT == null) return;
+      const T = this.dragT;
+      this.dragT = null;
+      el.classList.remove("drag");
+      this.$.tip.hidden = true;
+      if (commit) this.seek(T, realPlaying());
+    };
+    el.addEventListener("pointerup", () => stop(true));
+    el.addEventListener("pointercancel", () => stop(false));
   },
   paintScrub() {
     if (!this.$?.track) return;
@@ -947,10 +1009,6 @@ const player = {
     for (const p of this.pieces) if (p.ready) this.$.track.append(h("div", { class: "seg", style: `left:${(100 * p.start) / total}%;width:${(100 * p.dur) / total}%` }));
     this.$.played = h("div", { class: "played" });
     this.$.track.append(this.$.played);
-  },
-  scrubTo(e) {
-    const r = e.currentTarget.getBoundingClientRect();
-    this.seek(((e.clientX - r.left) / r.width) * this.chapterTotal(), true);
   },
   save() {
     if (!this.book || this.piece < 0) return;
@@ -965,7 +1023,7 @@ const player = {
   },
   media() {
     if (!("mediaSession" in navigator)) return;
-    navigator.mediaSession.metadata = new MediaMetadata({ title: this.ch.title, artist: this.book.author, album: this.book.title,
+    navigator.mediaSession.metadata = new MediaMetadata({ title: chapterLabel(this.ch.title, this.book.lang), artist: this.book.author, album: this.book.title,
       artwork: [{ src: `/api/books/${this.book.id}/cover`, sizes: "512x512" }] });
     const set = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch {} };
     set("play", () => this.toggle()); set("pause", () => this.toggle());
@@ -1013,6 +1071,8 @@ addEventListener("keydown", (e) => {
 async function route() {
   const [path, query] = location.hash.slice(1).split("?");
   const parts = (path || "/").split("/").filter(Boolean);
+  document.querySelectorAll(".sheet, .toast").forEach((el) => el.remove());
+  if (parts[0] !== "read") scrollTo(0, 0);
   try {
     if (parts[0] === "book" && parts[1]) await viewBook(parts[1]);
     else if (parts[0] === "system") await viewSystem();

@@ -45,6 +45,9 @@ along: the sentence highlighted, the word underlined. English and Spanish.
   not downloaded, rendering paused, server unreachable).
 - **Reading.** Sentence highlighting and a word underline. Long sentences highlight and step by clause.
   - Speed control, themes, and offline downloads ("next 3 hours" or the whole book).
+- **Background sounds** under the narration (≋ in the reader): rain, a fireplace, waves, space, focus (binaural beats)
+  or brown noise, with a volume slider. They are made on the phone as seamless one-minute loops, so there is nothing
+  to download and they work offline. They follow play and pause.
 
 **Rendering**
 - **Renders from where you are listening.** The next pieces come first, so you rarely wait. Pieces are 30 s, so a part

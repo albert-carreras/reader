@@ -15,6 +15,7 @@ const ICON = {
   list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
   type: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19l5-14 5 14M6 14h6M15 19l3-8 3 8M16 16.5h4"/></svg>',
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+  sound: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9c1.5-1.6 3-1.6 4.5 0s3 1.6 4.5 0 3-1.6 4.5 0 3 1.6 4.5 0"/><path d="M3 15c1.5-1.6 3-1.6 4.5 0s3 1.6 4.5 0 3-1.6 4.5 0 3 1.6 4.5 0"/></svg>',
 };
 
 // what went wrong on the phone, kept on the server (data/client.log): errors, recoveries, stalls, chapter changes
@@ -625,6 +626,150 @@ function viewSettings() {
   app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
 }
 
+// ------------------------------------------------------------------ background sounds
+//
+// A soft sound under the narration: rain, a fireplace, waves... (ElevenReader calls these soundscapes). Each is made
+// on this device by sounds.js, in a worker: a seamless one-minute loop, so there is nothing to download and it works
+// offline. It plays through Web Audio, beside the narration's <audio> element (which never goes through it), and it
+// follows the player: it fades in while the book plays or is about to (loading, waiting for rendering) and fades out
+// on any stop. iOS only lets Web Audio start during a tap, so the tap that plays also wakes it. Once stopped for a
+// while, the audio context is suspended so the audio hardware can sleep.
+
+const SOUNDS = [["rain", "Rain"], ["fire", "Fireplace"], ["waves", "Waves"], ["space", "Space"], ["focus", "Focus"], ["brown", "Brown noise"]];
+const SOUND_SR = 48000;      // the loops are made at this rate whatever the device's; Web Audio resamples if needed
+
+const ambient = {
+  ctx: null, master: null, cur: null, buf: null, making: new Map(), on: false, want: false, previewing: false, previewTimer: 0, sleepTimer: 0,
+  get kind() { const k = store.get("ambient", "off"); return SOUNDS.some(([v]) => v === k) ? k : "off"; },
+  get level() { return store.get("ambientLevel", 0.6); },
+  // the loops are at -23 LUFS and the narration at -19: the slider spans -55 to -27 LUFS (0.6 is about -38)
+  gain(v = this.level) { return v <= 0.01 ? 0 : 10 ** ((-32 + 28 * v) / 20); },
+
+  // the player's state changed: sound on while the book plays or is about to
+  follow(state = player.state) {
+    this.want = this.kind !== "off" && (state === "playing" || state === "loading" || state === "waiting");
+    if (this.want || this.previewing) this.start(); else this.stop();
+  },
+  pick(kind) {
+    store.set("ambient", kind);
+    clog("ambient", `pick ${kind}`);
+    if (kind === "off") { this.previewing = false; clearTimeout(this.previewTimer); }
+    this.follow();
+    if (kind !== "off" && !this.want) this.preview();
+  },
+  setLevel(v) {
+    store.set("ambientLevel", v);
+    if (this.ctx && (this.want || this.previewing)) this.fade(this.master.gain, this.gain(v), 0.05);
+    if (!this.want) this.preview();
+  },
+  // paused: let a choice be heard for a few seconds
+  preview() {
+    if (this.kind === "off") return;
+    clearTimeout(this.previewTimer);
+    this.previewing = true;
+    this.start();
+    this.previewTimer = setTimeout(() => { this.previewing = false; if (!this.want) this.stop(); }, 5000);
+  },
+  // make the chosen sound ahead of the first play, so it starts with the narration
+  prepare() { if (this.kind !== "off") this.make(this.kind); },
+
+  // the audio context, made or woken inside a tap where possible (iOS)
+  ensure() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      try { this.ctx = new AC(); } catch (e) { clog("ambient", `no audio context: ${e?.name}`); return null; }
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0;
+      this.master.connect(this.ctx.destination);
+      this.ctx.onstatechange = () => clog("ambient", `context ${this.ctx.state}`);
+    }
+    if (this.ctx.state !== "running") this.ctx.resume().catch((e) => clog("ambient", `resume refused: ${e?.name}`));
+    return this.ctx;
+  },
+  // move a gain smoothly from wherever it is now (no clicks, even mid-fade)
+  fade(param, v, tau) {
+    const t = this.ctx.currentTime;
+    param.cancelScheduledValues(t);
+    param.setTargetAtTime(v, t, tau);
+  },
+  start() {
+    clearTimeout(this.sleepTimer);
+    if (!this.ensure()) return;
+    const wasOn = this.on;
+    this.on = true;
+    this.fade(this.master.gain, this.gain(), 0.4);
+    const kind = this.kind;
+    if (kind === "off" || this.cur?.kind === kind) return;
+    // the old sound goes now, not once the new one is made (at once if it was faded out: it mustn't come back)
+    if (this.cur) { this.retire(this.cur, wasOn ? 0.4 : 0.02); this.cur = null; }
+    this.make(kind).then((b) => { if (b && this.kind === kind && (this.want || this.previewing) && this.cur?.kind !== kind) this.swap(b); });
+  },
+  retire(o, tau = 0.4) { this.fade(o.g.gain, 0, tau); o.src.stop(this.ctx.currentTime + tau * 8); },
+  stop() {
+    if (!this.ctx) return;
+    this.on = false;
+    this.fade(this.master.gain, 0, 0.35);
+    clearTimeout(this.sleepTimer);
+    this.sleepTimer = setTimeout(() => {          // still stopped: let the audio hardware sleep
+      if (this.want || this.previewing) return;
+      try { this.cur?.src.stop(); } catch {}
+      this.cur = null;
+      if (this.ctx.state === "running") this.ctx.suspend().catch(() => {});
+    }, 30000);
+  },
+  // crossfade to a loop, starting somewhere in it (so it doesn't begin the same way every time)
+  swap(b) {
+    const ctx = this.ctx, t = ctx.currentTime;
+    if (this.cur) this.retire(this.cur);
+    const src = ctx.createBufferSource(), g = ctx.createGain();
+    src.buffer = this.audioBuf(b);
+    src.loop = true;
+    g.gain.value = 0;
+    src.connect(g).connect(this.master);
+    src.start(t, Math.random() * src.buffer.duration);
+    this.cur = { kind: b.kind, src, g };
+    this.fade(g.gain, 1, 0.5);
+  },
+  // the loop for `kind`, made in a worker (about a second); only the current choice's is kept
+  make(kind) {
+    if (this.buf?.kind === kind) return Promise.resolve(this.buf);
+    if (this.making.has(kind)) return this.making.get(kind);
+    const p = new Promise((res) => {
+      let w;
+      try { w = new Worker(new URL("./sounds.js", import.meta.url), { type: "module" }); }
+      catch (e) { clog("ambient", `no worker: ${e?.message}`); return res(null); }
+      w.onmessage = ({ data }) => {
+        w.terminate();
+        if (data.error) { clog("ambient", `${kind}: ${data.error}`); return res(null); }
+        res({ kind, L: data.L, R: data.R, ms: data.ms });
+      };
+      w.onerror = (e) => { w.terminate(); clog("ambient", `worker: ${e.message || "failed to load"}`); res(null); };
+      w.postMessage({ kind, sr: SOUND_SR });
+    }).then((d) => {
+      this.making.delete(kind);
+      if (d) clog("ambient", `${kind} made in ${d.ms} ms`);
+      if (d && this.kind === kind) this.buf = d;      // the choice changed meanwhile: don't keep this one
+      return d;
+    });
+    this.making.set(kind, p);
+    return p;
+  },
+  // the samples as an AudioBuffer (needs the context, so only once something plays)
+  audioBuf(d) {
+    if (!d.buf) {
+      d.buf = this.ctx.createBuffer(2, d.L.length, SOUND_SR);
+      d.buf.copyToChannel(d.L, 0);
+      d.buf.copyToChannel(d.R, 1);
+      d.L = d.R = null;
+    }
+    return d.buf;
+  },
+};
+// iOS stops Web Audio for a call or Siri and only lets it restart during a tap: the next tap anywhere restarts it
+addEventListener("click", () => { if ((ambient.want || ambient.previewing) && ambient.ctx && ambient.ctx.state !== "running") ambient.ensure(); }, { capture: true });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && ambient.want && ambient.ctx && ambient.ctx.state !== "running") ambient.ensure(); });
+
 // ------------------------------------------------------------------ reader + player
 //
 // The audio is one continuous stream per book (MediaSource). The player appends ~2 s fragments of each rendered
@@ -690,6 +835,7 @@ const player = {
     this.speed(store.get(`speed:${bookId}`, 1));
     if (!this.tape) { this.setState("error", "This browser can't play audio streams"); return; }
     this.media();
+    ambient.prepare();
     if (here && !Number.isFinite(unit)) {            // back to the chapter that is playing: just show it
       this.startT = this.chapterTime();
       this.setCurrent(this.unitAtTime(this.startT)?.i ?? 0, true);
@@ -1102,7 +1248,9 @@ const player = {
     const top = h("header", { class: "top reader-top" }, h("div", { class: "wrap" },
       h("a", { class: "iconbtn", href: `#/book/${b.id}`, title: b.title, html: ICON.back }),
       h("div", { class: "titles" }, h("div", { class: "kicker" }, b.title), h("div", { class: "ttl" }, chapterLabel(ch.title, b.lang))),
-      h("button", { class: "iconbtn", title: "Text", html: ICON.type, onclick: (e) => this.sheet("look", e) })));
+      h("div", { class: "top-btns" },
+        this.$sound = h("button", { class: "iconbtn" + (ambient.kind !== "off" ? " on" : ""), title: "Background sound", "aria-label": "Background sound", html: ICON.sound, onclick: (e) => this.sheet("sound", e) }),
+        h("button", { class: "iconbtn", title: "Text", html: ICON.type, onclick: (e) => this.sheet("look", e) }))));
     this.$top = top;
     const page = h("article", { class: "page", lang: b.lang, "data-hl": prefs.highlight });
     const byBlock = new Map();
@@ -1192,6 +1340,15 @@ const player = {
       };
       paint();
       s.append(h("h3", {}, "Playback speed"), val, slider, chips);
+    } else if (kind === "sound") {
+      const cur = ambient.kind;
+      const pick = (k) => { ambient.pick(k); this.$sound?.classList.toggle("on", k !== "off"); this.sheet("sound", ev); };
+      const vol = h("input", { type: "range", min: "0", max: "1", step: "0.01", value: String(ambient.level), class: "speed-slider", "aria-label": "Background sound volume",
+        oninput: () => ambient.setLevel(+vol.value) });
+      s.append(h("h3", {}, "Background sound"),
+        h("div", { class: "opts" }, [["off", "Off"], ...SOUNDS].map(([k, l]) => h("button", { class: k === cur ? "on" : "", onclick: () => pick(k) }, l))));
+      if (cur !== "off") s.append(h("h3", {}, "Volume"), vol);
+      s.append(h("p", { class: "muted small sheet-note" }, cur === "focus" ? "Binaural beats: listen with headphones." : "Made on this phone and played under the narration. It follows play and pause."));
     } else {
       const sizes = [17, 19, 21, 23, 26];
       const themes = [["auto", "Auto"], ["light", "Light"], ["sepia", "Sepia"], ["dark", "Dark"], ["black", "Black"]];
@@ -1410,6 +1567,7 @@ const player = {
     this.say(msg, action, busy && !this.$?.play?.isConnected);      // the play button already spins on the reader
     if (this.$mini?.sub) this.$mini.sub.textContent = msg && state !== "playing" ? msg : chapterLabel(this.ch?.title, this.book?.lang);
     try { if (navigator.mediaSession) navigator.mediaSession.playbackState = state === "playing" ? "playing" : "paused"; } catch {}
+    ambient.follow(state);
   },
   // the message pill above the player: text, an optional spinner and an optional button
   say(msg, action = null, spinning = false) {

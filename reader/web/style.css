@@ -245,6 +245,9 @@ h2.section { font-size: .74rem; text-transform: uppercase; letter-spacing: .09em
 .sheet .list a.on { background: var(--accent-soft); font-weight: 650; }
 .speed-val { font: 700 1.7rem/1 var(--ui-font); font-variant-numeric: tabular-nums; margin: .15rem 0 .7rem; }
 .speed-slider { width: 100%; accent-color: var(--accent); margin: 0 0 1rem; }
+.sheet-note { margin: 0; }
+.top-btns { display: flex; flex: none; }
+.iconbtn.on { color: var(--accent); }
 
 /* toasts and the drop target */
 .toast { position: fixed; left: 50%; bottom: calc(1.25rem + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 60;

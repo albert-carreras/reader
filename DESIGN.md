@@ -1,5 +1,9 @@
 # Reader: self-hosted read-along audiobooks (draft v0.1)
 
+> The original design draft (2026-11-26), kept for its reasoning. Several decisions changed since: the engine is now
+> Pocket TTS with previous-sentence context, and playback is one continuous MediaSource stream. See the README and
+> [docs/roadmap.md](docs/roadmap.md).
+
 Personal ElevenReader replacement. The laptop is the server, CPU only, served from bored.cat. The iPhone (PWA) is the main client.
 Priorities, in order: **voice quality → listening UX → everything else**. Speed is secondary. Books render ahead of time, quietly.
 

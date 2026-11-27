@@ -26,6 +26,11 @@ EN = [
     ("World War II ended in 1945.", "World War two ended in nineteen forty five."),
     ("Read Chapter XII tonight.", "Read Chapter twelve tonight."),
     ("It was—as she knew—too late.", "It was, as she knew, too late."),
+    ("The book I wanted was gone.", "The book I wanted was gone."),
+    ("In Part I of the letter I wrote, I said no.", "In Part one of the letter I wrote, I said no."),
+    ("Read volume II, then volume I.", "Read volume two, then volume one."),
+    ("Call 555-1234.", "Call five five five, one two three four."),
+    ("The war (1914-1918) and pages 111-222.", "The war, nineteen fourteen to nineteen eighteen, and pages one hundred and eleven to two hundred and twenty two."),
 ]
 HEADINGS = [
     ("I. Perdido.", "es", "Capítulo uno. Perdido."),
@@ -56,13 +61,12 @@ def _units(text, lang):
 
 def test_raya_dialogue_unspaced():
     got = _units("—No puedo equivocarme—murmuró.—Me dijeron que sí.", "es")
-    assert [r for r, *_ in got] == ["speech", "tag", "speech"]
-    assert got[0][2] == "No puedo equivocarme," and got[1][2] == "murmuró."
+    assert [(r, t) for r, _, t in got] == [("speech", "No puedo equivocarme, murmuró."), ("speech", "Me dijeron que sí.")]
 
 
 def test_raya_dialogue_spaced():
     got = _units("—¿Vienes? —preguntó ella—. No tardes.", "es")
-    assert [(r, k) for r, k, _ in got] == [("speech", "yesno"), ("tag", "statement"), ("speech", "statement")]
+    assert [(r, t) for r, _, t in got] == [("speech", "¿Vienes? preguntó ella."), ("speech", "No tardes.")]
 
 
 def test_wh_vs_yesno():
@@ -74,8 +78,16 @@ def test_wh_vs_yesno():
 
 def test_quote_tag_keeps_sentence_open():
     got = _units("“And what is the use of a book,” thought Alice “without pictures or conversations?”", "en")
-    assert got[1] == ("tag", "continuation", "thought Alice,")
-    assert got[2][1] == "yesno"
+    assert got == [("speech", "yesno", "And what is the use of a book, thought Alice, without pictures or conversations?")]
+
+
+def test_quoted_mention_is_not_dialogue():
+    got = _units('The word, “sack,” was on page 345.', "en")
+    assert [r for r, *_ in got] == ["narration"] and got[0][2].startswith("The word, sack, was on page")
+    got = _units('“I’m sorry,” he said, “it’s just that…”', "en")
+    assert [(r, t) for r, _, t in got] == [("speech", "I'm sorry, he said, it's just that...")]
+    got = _units('“What does it mean?” Biscuit looked thoughtful. “I’m not sure.”', "en")
+    assert len(got) == 3                                      # an action beat is its own sentence
 
 
 def test_small_caps_opening():

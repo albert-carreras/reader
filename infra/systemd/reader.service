@@ -19,6 +19,11 @@ RestartSec=5
 # rendering is background work: keep the laptop responsive
 Nice=5
 CPUWeight=50
+# never take the machine down (2026-11-27 it ran out of memory and froze): past 6 GB the kernel reclaims from this
+# service first; past 7 GB only this service is killed (and restarts). Almost no swap: thrashing is what froze it.
+MemoryHigh=6G
+MemoryMax=7G
+MemorySwapMax=256M
 
 [Install]
 WantedBy=default.target

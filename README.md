@@ -1,25 +1,120 @@
 # reader
 
-A self-hosted, read-along audiobook player, built to replace ElevenReader.
-1. Add an EPUB.
-2. It's narrated by a local TTS (Phonon, CPU only) in the background.
-3. Listen in the browser while the text follows along: sentence highlighted, word underlined.
+A self-hosted read-along audiobook app. Add an EPUB, and a local text-to-speech model narrates it in the
+background on an ordinary laptop (CPU only). Listen on the phone as an installed web app, with the text following
+along: the sentence highlighted, the word underlined. English and Spanish.
 
-- **Audio pipeline** (`reader/`). Detail in [DESIGN.md](DESIGN.md) §4.
-  - The EPUB is parsed into chapters and blocks.
-  - Text becomes speech units: dialogue vs narrator tags, intonation kinds, and spoken forms via the NeMo grammars plus book rules.
-  - Each unit gets Phonon takes, scored on the pitch contour. Verification uses MMS forced alignment, which also yields word timings.
-  - A PSOLA fix corrects endings when needed.
-  - Units are assembled into ~75 s AAC segments.
-- **Web app** (`reader/server.py`, `reader/web/`).
-  - FastAPI with one background renderer that always works from wherever you are listening.
-  - Vanilla-JS UI: library, book page, reader/player.
-  - Controls: sentence and ±15 s skips, speed, chapter auto-advance, Media Session, keyboard, position sync.
-- **Deploy:** [docs/deploy.md](docs/deploy.md). Same pattern as piso-radar and cfo: user service, Cloudflare Tunnel, Workers VPC edge, Cloudflare Access.
+<p>
+  <img src="docs/screenshots/library.jpg" width="260" alt="Library">
+  <img src="docs/screenshots/reader-light.png" width="260" alt="Reading along: sentence highlighted, word underlined">
+  <img src="docs/screenshots/reader-dark.png" width="260" alt="The reader in dark mode">
+</p>
+<p>
+  <img src="docs/screenshots/book.png" width="260" alt="A book: rendering progress, offline downloads, chapters">
+  <img src="docs/screenshots/waiting.png" width="260" alt="Caught up with the renderer: a countdown, then it plays by itself">
+  <img src="docs/screenshots/now-playing.jpg" width="260" alt="Playback continues on every screen, with a now-playing bar">
+</p>
+
+*Screenshots use public-domain books (Carroll, Dickens, Pérez Galdós).*
+
+## What it does
+
+**Narration**
+- **Voice.** [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) (Kyutai, 100M) with its LibriVox-narrator
+  voices: `caro_davy` for English, `lola` for Spanish.
+  - Both were picked in blind listening tests over [Phonon](https://gradium.ai/phonon), Kokoro and calmer voices.
+  - Phonon is still selectable per book.
+- **Previous-sentence context.** Each sentence's voice prompt includes the end of the sentence before. The narration
+  flows instead of every sentence starting the same way.
+- **Text that reads right.**
+  - Numbers, dates, Roman numerals, ordinals and abbreviations are spelled out (NeMo grammars plus our own rules).
+  - Small-caps openings, quoted words that aren't dialogue, and "the book I wanted" (not "book one") are handled.
+  - Dialogue and its tag are voiced as one sentence: *"I'm sorry," he said, "it's just that…"*.
+- **Checked takes.**
+  - Every sentence is force-aligned against its text (MMS). Mumbled, skipped or babbled takes are re-rendered, and the
+    alignment provides the word timings.
+  - Dead air inside a take is shortened.
+  - A wrong sentence ending (a statement rising, a question falling) gets a gentle pitch fix.
+- **Mastered like an audiobook.** Even loudness, peaks below −3 dB, room tone in the pauses, pauses scaled to sentence
+  and paragraph length.
+
+**Listening**
+- **One continuous stream per book (MediaSource).** Chapters follow each other without the audio element ever ending.
+  That's what keeps playback going on a locked iPhone.
+- **Lock screen and AirPods:** play/pause, ±15 s skips, sentence steps.
+  - After any stop (a pause, a call, a navigation prompt) it rewinds a little to a pause between words.
+- **Playback continues on every screen,** with a now-playing bar.
+- **The play button always answers.** A spinner while it loads; a countdown while a part is still rendering
+  ("about 25 s, 2 of 6 sentences"), after which it plays by itself; and a plain reason when it can't play (offline and
+  not downloaded, rendering paused, server unreachable).
+- **Reading.** Sentence highlighting and a word underline. Long sentences highlight and step by clause.
+  - Speed control, themes, and offline downloads ("next 3 hours" or the whole book).
+
+**Rendering**
+- **Renders from where you are listening.** The next pieces come first, so you rarely wait. Pieces are 30 s, so a part
+  that isn't rendered yet starts within about half a minute.
+- **Several chapters at once** (the CPU setting picks how many), each its own chain of context.
+- **Runs at low priority and gives its memory back** (~4 GB → ~0.4 GB) after 5 idle minutes.
+- **Survives restarts and upgrades.** Your place is kept by its position in the text; finished chapters keep their
+  audio; a player streaming audio that was rebuilt reloads it in place.
+
+## How it works
+
+```
+EPUB ─► book.py      chapters → blocks (headings, paragraphs, verse, scene breaks); front/back matter skipped
+     ─► segment.py   sentences; dialogue vs narration; intonation kind; pauses
+     ─► textnorm.py  spoken form (numbers, dates, abbreviations, Roman numerals …)
+     ─► render.py    Pocket TTS take, with the previous sentence as context ─► MMS forced alignment (verify + word
+                     timings) ─► dead-air squash, ending fix ─► per-sentence cache
+     ─► worker.py    30 s pieces, then one file per chapter (AAC); render lanes; fragmented copies for streaming
+     ─► server.py    FastAPI: library, chapters, stream files (byte ranges), positions, status
+     ─► web/app.js   vanilla-JS PWA: MediaSource "tape" player, read-along, offline store (IndexedDB)
+```
+
+More detail: [DESIGN.md](DESIGN.md) (the original design), [docs/roadmap.md](docs/roadmap.md) (what changed and
+why), [docs/deploy.md](docs/deploy.md) (hosting).
+
+## Running it
+
+Requires `uv`, `ffmpeg` and Python 3.12. Pocket's voice-cloning weights are gated on Hugging Face (accept the terms
+at huggingface.co/kyutai/pocket-tts and log in) and are needed for the context prompts.
 
 ```
 uv sync
-./stack local                                    # http://127.0.0.1:8130
-uv run reader render book.epub -c 3 -n 20        # CLI: render part of a chapter to renders/
-uv run pytest -q                                 # text-normalisation regression cases
+./stack local                                   # http://127.0.0.1:8130 (web app + renderer in one process)
+uv run pytest -q                                # text, segmentation and dialogue regression cases
+uv run reader script BOOK.epub -c 4             # what will be spoken for chapter 4 (no audio)
+uv run reader render BOOK.epub -c 4 -n 20       # render part of a chapter to renders/
+uv run reader qa [BOOK]                         # the rendered sentences most worth a listen, with timestamps
+```
+
+As a service: `./stack install`, `./stack deploy`, `./stack status`, `./stack logs` (see [docs/deploy.md](docs/deploy.md)).
+
+**Trying changes safely:** run a second instance on a copy of the library, never the live one:
+
+```
+cp -al data/books /tmp/copy/books && cp -r data/cache /tmp/copy/cache
+READER_DATA=/tmp/copy READER_PORT=8131 uv run python -m reader.server         # READER_NO_WORKER=1: serve only
+```
+
+Settings (environment, e.g. in `~/.config/reader/env`):
+
+| Variable | Default | |
+|---|---|---|
+| `READER_DATA` | `~/reader/data` | books, audio, take cache, positions, `client.log` (the phone's playback log) |
+| `READER_PORT` | `8130` | |
+| `READER_THREADS`, `READER_NICE` | `4`, `10` | renderer CPU (also set in the app: Low / Medium / High) |
+| `READER_CONTEXT` | `1` | previous-sentence context for Pocket voices |
+| `READER_IDLE_RELEASE` | `300` | seconds idle before models are unloaded |
+| `READER_ACCESS_TEAM`, `READER_ACCESS_AUD` | | Cloudflare Access, checked on every request through the edge |
+
+## Layout
+
+```
+reader/        the app: book · segment · textnorm · engine · render · align · prosody · reshape · timing ·
+               library · worker · server · cli · web/
+tests/         regression cases for text and segmentation
+infra/         systemd units, Cloudflare tunnel + edge Worker
+docs/          roadmap, deploy notes, screenshots
+bakeoff/       (not in git) the model bake-offs and blind listening reels
 ```

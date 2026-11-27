@@ -4,17 +4,37 @@ const app = $("#app");
 const audio = $("#audio");
 
 const ICON = {
+  spin: '<svg class="spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="34 60"/></svg>',
   back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
   play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/></svg>',
   pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>',
-  prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5v14"/><path d="M18 6l-8 6 8 6z" fill="currentColor"/></svg>',
-  next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 5v14"/><path d="M6 6l8 6-8 6z" fill="currentColor"/></svg>',
+  prev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 5.5L8 12l6.5 6.5"/></svg>',
+  next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 5.5L16 12l-6.5 6.5"/></svg>',
   back15: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v4h4"/><text x="12" y="15.5" font-size="7.5" text-anchor="middle" fill="currentColor" stroke="none" font-family="system-ui" font-weight="700">15</text></svg>',
   fwd15: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4v4h-4"/><text x="12" y="15.5" font-size="7.5" text-anchor="middle" fill="currentColor" stroke="none" font-family="system-ui" font-weight="700">15</text></svg>',
   list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
   type: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19l5-14 5 14M6 14h6M15 19l3-8 3 8M16 16.5h4"/></svg>',
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
 };
+
+// what went wrong on the phone, kept on the server (data/client.log): errors, recoveries, stalls, chapter changes
+const clogQueue = [];
+let clogTimer = 0;
+const clog = (kind, detail = "") => {
+  try {
+    clogQueue.push({ at: Date.now(), kind, detail: String(detail).slice(0, 300), book: player.book?.id, ch: player.ch?.index,
+      t: player.ch ? Math.round(player.chapterTime()) : null, paused: audio.paused, vis: document.visibilityState, online: navigator.onLine });
+    if (clogQueue.length > 200) clogQueue.shift();
+    clearTimeout(clogTimer);
+    clogTimer = setTimeout(() => {
+      const batch = clogQueue.splice(0);
+      fetch("/api/log", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(batch), keepalive: true })
+        .then((r) => { if (!r.ok) throw 0; }).catch(() => clogQueue.unshift(...batch.slice(-100)));
+    }, 2000);
+  } catch {}
+};
+addEventListener("error", (e) => clog("js-error", `${e.message} @${e.lineno}`));
+addEventListener("unhandledrejection", (e) => clog("js-reject", e.reason?.message || e.reason));
 
 const KEEP_OFFLINE = /^\/api\/books(\/[a-z0-9-]+)?$/;      // library + book pages are always kept for offline use
 const api = async (path, opts = {}) => {
@@ -28,7 +48,7 @@ const api = async (path, opts = {}) => {
   }
   if (!r.ok) {
     if (isGet && r.status >= 500) { const v = await idb.get(path).catch(() => null); if (v?.type === "json") return v.data; }   // server restarting
-    throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+    throw Object.assign(new Error((await r.json().catch(() => ({}))).detail || r.statusText), { status: r.status });
   }
   const j = await r.json();
   if (isGet && KEEP_OFFLINE.test(path)) idb.put(path, { type: "json", data: j }).catch(() => {});
@@ -53,7 +73,21 @@ const fmt = (s) => {
 const human = (s) => { s = Math.round(s || 0); const hh = Math.floor(s / 3600), mm = Math.round((s % 3600) / 60); return hh ? `${hh} h ${mm} min` : `${mm} min`; };
 const fill = (el, ...kids) => el.replaceChildren(...kids.flat().filter((k) => k != null && k !== false));
 const NUMERAL = /^([IVXLCDM]+|\d+)\.?$/i;
-const chapterLabel = (title, lang) => (NUMERAL.test((title || "").trim()) ? `${lang === "es" ? "Capítulo" : "Chapter"} ${title.trim().replace(/\.$/, "")}` : title);
+const SMALL_WORDS = new Set("a an and as at but by for in of on or the to vs via de del el la las lo los y e o u en con por para al".split(" "));
+const titleCase = (t, lang = "en") => {      // Spanish uses sentence case: "Sobre la autora"
+  const letters = t.replace(/[^\p{L}]/gu, "");
+  if (letters.length < 4 || letters !== letters.toUpperCase()) return t;
+  let first = true;
+  return t.toLowerCase().replace(/[\p{L}'’]+/gu, (w, at, all) => {
+    const up = w.toUpperCase();
+    if (/[:.!?—–-]\s*$/.test(all.slice(0, at))) first = true;      // "Year 102: The Most…"
+    const out = /^[IVXLCDM]+$/.test(up) && up.length <= 4 && up !== "MIL" ? up
+      : !first && (lang === "es" || SMALL_WORDS.has(w)) ? w : w[0].toUpperCase() + w.slice(1);
+    first = false;
+    return out;
+  });
+};
+const chapterLabel = (title, lang) => (NUMERAL.test((title || "").trim()) ? `${lang === "es" ? "Capítulo" : "Chapter"} ${title.trim().replace(/\.$/, "")}` : titleCase(title || "", lang));
 const toast = (msg, ms = 2800) => { const t = h("div", { class: "toast" }, msg); document.body.append(t); setTimeout(() => t.remove(), ms); };
 const store = {
   get: (k, d) => { try { return JSON.parse(localStorage.getItem("reader:" + k)) ?? d; } catch { return d; } },
@@ -99,7 +133,7 @@ const positions = {
     const p = this.local(id);
     if (!p || p.synced) return;
     try {
-      await api(`/api/books/${id}/position`, { method: "PUT", body: JSON.stringify({ chapter: p.chapter, unit: p.unit, t: p.t, at: p.at }) });
+      await api(`/api/books/${id}/position`, { method: "PUT", body: JSON.stringify({ chapter: p.chapter, unit: p.unit, t: p.t, at: p.at, block: p.block, start: p.start, du: p.du }) });
       store.set(`pos:${id}`, { ...p, synced: true });
     } catch {}
   },
@@ -142,24 +176,27 @@ const idb = (() => {
 })();
 
 const DL_WINDOW = 3 * 3600;   // "next 3 hours"
+// A downloaded chapter is its stream file (fragmented MP4, fed to the player as is), that file's fragment table and
+// timeline, and the chapter text, each stored under the path the app fetches it from.
+const dlKeys = (id, n) => [`/api/books/${id}/stream/${n}/full.mp4`, `/api/books/${id}/stream/${n}/full.json`, `/api/books/${id}/chapters/${n}`];
 const offline = {
   busy: {},          // bookId -> {done, total, label}
   listeners: new Set(),
   emit() { for (const f of this.listeners) try { f(); } catch {} },
   mode: (id) => store.get(`dl:${id}`, "off"),
-  index: (id) => store.get(`dlx:${id}`, {}),            // {chapterIndex: bytes}
-  bytes(id) { return Object.values(this.index(id)).reduce((a, b) => a + b, 0); },
+  index: (id) => store.get(`dlx2:${id}`, {}),           // {chapterIndex: {b: bytes, v: stream version}}
+  bytes(id) { return Object.values(this.index(id)).reduce((a, x) => a + (x.b || 0), 0); },
   has(id, n) { return n in this.index(id); },
+  version(id, n) { return this.index(id)[n]?.v; },
   async setMode(id, m) {
     store.set(`dl:${id}`, m);
     if (m !== "off" && navigator.storage?.persist) navigator.storage.persist().catch(() => {});
     await this.sync(id);
   },
-  async audioURL(id, n) {
+  async blob(id, n) {
     if (!this.has(id, n)) return null;
-    const v = await idb.get(`/api/books/${id}/chapter-audio/${n}.m4a`).catch(() => null);
-    if (!v?.data) return null;
-    return URL.createObjectURL(v.data);
+    const v = await idb.get(dlKeys(id, n)[0]).catch(() => null);
+    return v?.data || null;
   },
   // which chapters should be on the phone right now
   wanted(b, mode) {
@@ -173,8 +210,8 @@ const offline = {
     return out;
   },
   async drop(id, n) {
-    for (const k of [`/api/books/${id}/chapter-audio/${n}.m4a`, `/api/books/${id}/chapters/${n}`, `/api/books/${id}/chapters/${n}/timeline`]) await idb.del(k).catch(() => {});
-    const ix = this.index(id); delete ix[n]; store.set(`dlx:${id}`, ix);
+    for (const k of dlKeys(id, n)) await idb.del(k).catch(() => {});
+    const ix = this.index(id); delete ix[n]; store.set(`dlx2:${id}`, ix);
   },
   async dropAll(id) { for (const n of Object.keys(this.index(id))) await this.drop(id, n); this.emit(); },
   async sync(id) {
@@ -185,11 +222,12 @@ const offline = {
     api("/api/books").catch(() => {});      // keep the library list on the phone too
     const want = new Set(this.wanted(b, mode));
     for (const n of Object.keys(this.index(id)).map(Number)) if (!want.has(n)) await this.drop(id, n);
-    const todo = b.chapters.filter((c) => want.has(c.index) && !this.has(id, c.index));
+    const todo = b.chapters.filter((c) => want.has(c.index) && (!this.has(id, c.index) || (c.v && c.v !== this.version(id, c.index))));
     const ready = todo.filter((c) => c.full);
     if (!ready.length) { this.emit(); return; }
     this.busy[id] = { done: 0, total: ready.length, label: "" };
     this.emit();
+    const json = (r) => { if (!r.ok) throw new Error(r.statusText); return r.json(); };
     try {
       if (!(await idb.get(`/api/books/${id}/cover`).catch(() => null))) {
         const r = await fetch(`/api/books/${id}/cover`);
@@ -198,13 +236,13 @@ const offline = {
       for (const c of ready) {
         this.busy[id].label = c.title;
         this.emit();
-        const base = `/api/books/${id}/chapters/${c.index}`;
-        const [cj, tl] = await Promise.all([fetch(base).then((r) => r.json()), fetch(`${base}/timeline`).then((r) => r.json())]);
-        const audio = await fetch(`/api/books/${id}/chapter-audio/${c.index}.m4a`).then((r) => { if (!r.ok) throw new Error(r.statusText); return r.blob(); });
-        await idb.put(base, { type: "json", data: cj });
-        await idb.put(`${base}/timeline`, { type: "json", data: tl });
-        await idb.put(`/api/books/${id}/chapter-audio/${c.index}.m4a`, { type: "blob", data: audio });
-        store.set(`dlx:${id}`, { ...this.index(id), [c.index]: audio.size });
+        const [mp4, ixKey, chKey] = dlKeys(id, c.index);
+        const [cj, ix] = await Promise.all([fetch(chKey).then(json), fetch(ixKey).then(json)]);
+        const data = await fetch(`${mp4}?v=${ix.v}`).then((r) => { if (!r.ok) throw new Error(r.statusText); return r.blob(); });
+        await idb.put(chKey, { type: "json", data: cj });
+        await idb.put(ixKey, { type: "json", data: ix });
+        await idb.put(mp4, { type: "blob", data });
+        store.set(`dlx2:${id}`, { ...this.index(id), [c.index]: { b: data.size, v: ix.v } });
         this.busy[id].done++;
         this.emit();
       }
@@ -217,6 +255,12 @@ const offline = {
     for (const id of ids) if (this.mode(id) !== "off") await this.sync(id);
   },
 };
+// downloads from before the continuous player were plain .m4a files: drop them; sync fetches the new format
+for (const k of Object.keys(localStorage).filter((k) => k.startsWith("reader:dlx:"))) {
+  const id = k.slice(11);
+  for (const n of Object.keys(store.get(`dlx:${id}`, {}))) for (const p of [`/api/books/${id}/chapter-audio/${n}.m4a`, `/api/books/${id}/chapters/${n}/timeline`]) idb.del(p).catch(() => {});
+  localStorage.removeItem(k);
+}
 addEventListener("online", () => offline.syncAll());
 setInterval(() => offline.syncAll(), 10 * 60 * 1000);
 
@@ -229,6 +273,7 @@ const prefs = new Proxy({}, {
 const REWIND_SCALE = { off: 0, short: 0.5, normal: 1, long: 1.75 };
 const bytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${Math.round(n / 1e6)} MB` : `${Math.round((n || 0) / 1e3)} kB`);
 const eta = (s) => (s == null ? "" : s < 90 ? "under 2 min" : human(s));
+const short = (s) => { s = Math.round(s || 0); const hh = Math.floor(s / 3600), mm = Math.round((s % 3600) / 60); return hh ? `${hh}h ${String(mm).padStart(2, "0")}m` : s < 90 ? "< 2m" : `${mm}m`; };
 const pct = (a, b) => Math.round((100 * (a || 0)) / Math.max(b || 1, 1));
 const switchEl = (on, onchange, label) => {
   const el = h("button", { class: "switch" + (on ? " on" : ""), role: "switch", "aria-checked": String(on), "aria-label": label || "", onclick: (e) => { e.stopPropagation(); onchange(!on); } }, h("i"));
@@ -315,7 +360,7 @@ addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; $("#drop").
 
 // ------------------------------------------------------------------ library
 async function viewLibrary() {
-  player.detach();
+  player.hide();
   const books = await api("/api/books");
   const top = topbar(brand(), null, renderChip(), gear(), h("button", { class: "iconbtn add", title: "Add book", onclick: picker, html: ICON.plus }));
   const main = h("main", { class: "wrap" });
@@ -348,12 +393,12 @@ async function viewLibrary() {
     }
     main.append(grid);
   }
-  app.replaceChildren(top, main);
+  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
 }
 
 // ------------------------------------------------------------------ book page
 async function viewBook(id) {
-  player.detach();
+  player.hide();
   const b = await api(`/api/books/${id}`);
   const pos = positions.best(id, b.position);
   const playable = b.chapters.filter((c) => c.n_units);
@@ -363,7 +408,7 @@ async function viewBook(id) {
   const top = topbar(back("#/", "Library"), null, renderChip(), gear());
 
   const state = !b.render ? ["off", "Rendering is off for this book"] : done ? ["done", "Fully rendered"]
-    : b.rendering_now ? ["on", "Rendering now"] : ["queued", "Queued"];
+    : b.rendering_now ? ["on", "Rendering now" + ((c) => c ? ` · ${chapterLabel(c.title, b.lang)}` : "")(b.chapters.find((c) => c.index === b.rendering_at))] : ["queued", "Queued"];
   const toggleRender = async () => { await api(`/api/books/${id}`, { method: "PATCH", body: JSON.stringify({ render: !b.render }) }); viewBook(id); };
   const renderCard = h("section", { class: "card-box" },
     h("div", { class: "row-between" },
@@ -429,16 +474,16 @@ async function viewBook(id) {
     renderCard, dlBox,
     h("h2", { class: "section" }, "Chapters"), list,
     h("h2", { class: "section" }, "Book"), settingsBox);
-  app.replaceChildren(top, main);
+  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
 }
 
 // ------------------------------------------------------------------ rendering & storage
 let sysTimer = 0;
 async function viewSystem() {
-  player.detach();
+  player.hide();
   const top = topbar(back("#/", "Library"), h("div", { class: "page-title" }, "Rendering & storage"), gear());
   const main = h("main", { class: "wrap narrow" });
-  app.replaceChildren(top, main);
+  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
   const statusBox = h("section", { class: "card-box" }), queueBox = h("section", { class: "card-box rows" }), storeBox = h("section", { class: "card-box rows" });
   main.append(statusBox, h("h2", { class: "section" }, "Books"), queueBox, h("h2", { class: "section" }, "Storage"), storeBox);
 
@@ -452,14 +497,15 @@ async function viewSystem() {
       h("div", { class: "row-between" },
         h("div", {}, h("div", { class: "label big" }, h("span", { class: `dot ${paused ? "off" : w.state === "rendering" ? "on" : w.state === "error" ? "err" : "done"}` }),
           paused ? "Paused" : w.state === "rendering" ? "Rendering" : w.state === "error" ? "Something went wrong" : "Idle — nothing left to render"),
-          job && !paused ? h("div", { class: "muted small" }, `${job.title} · ${job.chapter_title}, part ${job.segment + 1} of ${job.of}`) : null,
+          job && !paused ? h("div", { class: "muted small" }, `${job.title} · ${chapterLabel(job.chapter_title, cur?.lang)}, part ${job.segment + 1} of ${job.of}`) : null,
+          ...(!paused ? (w.lanes || []).map((l) => h("div", { class: "muted small" }, `Also: ${l.title} · ${chapterLabel(l.chapter_title, s.queue.find((q) => q.id === l.book)?.lang)}, part ${l.segment + 1} of ${l.of}`)) : []),
           w.state === "error" ? h("div", { class: "muted small" }, w.error || "") : null),
         h("button", { class: "btn sm" + (paused ? "" : " ghost"), onclick: async () => { await api("/api/system", { method: "PUT", body: JSON.stringify({ paused: !paused }) }); paint(); } }, paused ? "Resume" : "Pause all")),
       cur ? h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(cur.ready, cur.total)}%` })) : null,
       h("div", { class: "stats" },
-        h("div", {}, h("b", {}, w.rate ? `${w.rate.toFixed(1)}×` : "—"), h("span", {}, "realtime speed")),
+        h("div", {}, h("b", {}, w.rate ? `${w.rate.toFixed(1)}×` : "—"), h("span", {}, "speed")),
         h("div", {}, h("b", {}, cur ? `${pct(cur.ready, cur.total)}%` : "—"), h("span", {}, "book ready")),
-        h("div", {}, h("b", {}, cur && cur.eta != null ? eta(cur.eta) : "—"), h("span", {}, "left"))),
+        h("div", {}, h("b", {}, cur && cur.eta != null ? short(cur.eta) : "—"), h("span", {}, "left"))),
       h("div", { class: "row-between stack top-gap" }, h("div", {}, h("div", { class: "label" }, "CPU for rendering"), h("div", { class: "muted small" }, "More is faster, but the laptop gets busier and warmer")),
         seg([[2, "Low"], [4, "Medium"], [8, "High"]], s.settings.threads, async (v) => { await api("/api/system", { method: "PUT", body: JSON.stringify({ threads: v }) }); paint(); })));
     fill(queueBox, ...(s.queue.length ? s.queue.map((q) => h("div", { class: "row-between" },
@@ -492,11 +538,11 @@ async function viewSystem() {
 
 // ------------------------------------------------------------------ settings
 function viewSettings() {
-  player.detach();
+  player.hide();
   const top = topbar(back("#/", "Library"), h("div", { class: "page-title" }, "Settings"), h("span", { class: "iconbtn", "aria-hidden": "true" }));
   const row = (label, hint, control) => h("div", { class: "row-between" + (control.classList.contains("segctl") ? " stack" : "") }, h("div", {}, h("div", { class: "label" }, label), hint ? h("div", { class: "muted small" }, hint) : null), control);
   const repaint = () => viewSettings();
-  const dlIds = Object.keys(localStorage).filter((k) => k.startsWith("reader:dlx:")).map((k) => k.slice(11));
+  const dlIds = Object.keys(localStorage).filter((k) => k.startsWith("reader:dlx2:")).map((k) => k.slice(12));
   const dlTotal = dlIds.reduce((a, id) => a + offline.bytes(id), 0);
   const dlHint = h("div", { class: "muted small" }, dlTotal ? `${bytes(dlTotal)} of downloaded audio` : "Nothing downloaded");
   navigator.storage?.estimate?.().then((e) => { if (e.quota) dlHint.textContent += ` · room for about ${bytes(Math.max(0, e.quota - e.usage))} more`; }).catch(() => {});
@@ -524,13 +570,25 @@ function viewSettings() {
     h("h2", { class: "section" }, "Rendering"),
     h("section", { class: "card-box rows" }, h("a", { class: "row-between", href: "#/system" }, h("div", {}, h("div", { class: "label" }, "Rendering & storage"), h("div", { class: "muted small" }, "Progress, pause, CPU use, disk space")), h("span", { class: "chev", html: ICON2.chev }))),
     h("p", { class: "muted small center" }, "Preferences on this page are saved on this device."));
-  app.replaceChildren(top, main);
+  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
 }
 
 // ------------------------------------------------------------------ reader + player
 //
-// Everything is measured in *chapter time* (seconds into the chapter). A chapter plays from one continuous file once
-// it is fully rendered; while it is still rendering, it plays from ~75 s pieces. `pieces` hides the difference.
+// The audio is one continuous stream per book (MediaSource). The player appends ~2 s fragments of each rendered
+// file (a whole chapter, or the ~75 s pieces of a chapter that is still rendering), file after file and chapter
+// after chapter, staying about two minutes ahead of the playhead. The <audio> element never ends and never changes
+// source between chapters. That matters on the iPhone: when an element ends while the screen is locked, iOS closes
+// the web app's audio session and won't let it start the next file until the app is on screen again.
+// Anchors map stream time <-> (chapter, file, seconds into the file). Everything the UI shows is chapter time.
+
+const MSE = window.ManagedMediaSource || window.MediaSource;
+try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch {}   // Safari: this page plays media, not UI sounds
+const MIME = 'audio/mp4; codecs="mp4a.40.2"';
+const AHEAD = 120;          // seconds of audio kept buffered past the playhead
+const BEHIND = 40;          // ... and kept behind it, so short rewinds are instant
+const LEAD = 20;            // a jump starts appending this much earlier than its target, for the same reason
+const BATCH = 384 * 1024;   // bytes per request
 
 const skipIcon = (dir) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${dir < 0
   ? '<path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v4h4"/>' : '<path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4v4h-4"/>'}<text x="12" y="15.5" font-size="7.5" text-anchor="middle" fill="currentColor" stroke="none" font-family="system-ui" font-weight="700">${prefs.skip}</text></svg>`;
@@ -540,126 +598,426 @@ const SPEED_PRESETS = [0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
 const rewindFor = (ms) => (ms < 1500 ? 0 : ms < 30e3 ? 4 : ms < 5 * 60e3 ? 8 : ms < 60 * 60e3 ? 15 : 30) * (REWIND_SCALE[prefs.rewind] ?? 1);
 
 const player = {
-  book: null, ch: null, unitEls: [], pieces: [], piece: -1, cur: -1, curWord: null, follow: true,
-  waiting: null, stoppedAt: 0, raf: 0, root: null, loading: false, retry: 0, retryTimer: 0, userPaused: true,
+  book: null, ch: null, chs: new Map(), ut: [], clauses: new Map(), curClause: null, unitEls: [], cur: -1, curWord: null, follow: true, tape: null,
+  target: null, waiting: null, pollTimer: 0, stallTimer: 0, retryTimer: 0, retry: 0, stoppedAt: 0, startT: 0, raf: 0, root: null, userPaused: true,
 
-  detach() {
+  // leaving the reader: its page goes, the audio keeps playing (other screens show the now-playing bar)
+  hide() {
     document.body.classList.remove("has-player");
-    audio.pause();
     this.wake(false);
     removeEventListener("scroll", this.onScroll);
     cancelAnimationFrame(this.raf);
-    clearTimeout(this.waiting); clearTimeout(this.retryTimer);
-    this.waiting = null;
     this.root = null;
   },
 
   async open(bookId, chIndex, unit, autoplay) {
-    this.detach();
+    this.hide();
     document.body.classList.add("has-player");
     this.follow = prefs.follow;
-    const [b, ch] = await Promise.all([api(`/api/books/${bookId}`), api(`/api/books/${bookId}/chapters/${chIndex}`)]);
-    this.book = b; this.ch = ch; this.cur = -1; this.curWord = null; this.piece = -1;
+    const same = !!this.tape && this.book?.id === bookId;      // this book's stream is already going: keep it
+    if (!same) {                                      // another book: stop this one and its pending retries
+      audio.pause();
+      for (const k of ["waiting", "retryTimer", "pollTimer", "stallTimer"]) clearTimeout(this[k]);
+      this.waiting = null;
+    }
+    const b = await api(`/api/books/${bookId}`);
+    if (!same) this.chs = new Map();
+    this.book = b;
+    const here = same && this.map(audio.currentTime)?.n === chIndex;
+    if (!same) this.newTape();
+    const e = await this.entry(chIndex, !here);     // the chapter in the stream keeps its files (anchors point at them)
+    this.ch = e.c; this.cur = -1; this.curWord = null;
     this.render();
+    this.layout();
     this.speed(store.get(`speed:${bookId}`, 1));
-    await this.loadPieces();
+    if (!this.tape) { this.setState("error", "This browser can't play audio streams"); return; }
     this.media();
+    if (here && !Number.isFinite(unit)) {            // back to the chapter that is playing: just show it
+      this.startT = this.chapterTime();
+      this.setCurrent(this.unitAtTime(this.startT)?.i ?? 0, true);
+      this.setPlayIcon(audio.paused);
+      this.loop();
+      if (autoplay && audio.paused) this.toggle();
+      return;
+    }
     // where to start: an explicit unit, else the saved position (with a rewind for how long we were away)
     const pos = positions.best(bookId, b.position);
     let T = 0;
     if (Number.isFinite(unit)) T = this.timeOfUnit(unit);
-    else if (pos && pos.chapter === ch.index) T = this.snapBack(pos.t ?? this.timeOfUnit(pos.unit), rewindFor(Date.now() - (pos.at || 0)));
-    this.setCurrent(this.unitAtTime(T)?.i ?? (Number.isFinite(unit) ? unit : 0), true);
+    else if (pos && pos.chapter === chIndex) T = this.snapBack(this.resolve(pos), rewindFor(Date.now() - (pos.at || 0)));
     this.startT = T;
+    this.setCurrent(this.unitAtTime(T)?.i ?? (Number.isFinite(unit) ? unit : 0), true);
     api(`/api/books/${bookId}/focus`, { method: "POST", body: JSON.stringify({ chapter: chIndex, unit: Math.max(this.cur, 0) }) }).catch(() => {});
-    this.paintScrub();
     this.loop();
-    if (autoplay) return this.seek(T, true);
-    await this.preload(T);
-  },
-  // load the file for time T and park the playhead there, so a tap on play can start audio synchronously (iOS)
-  async preload(T) {
-    const k = this.pieceAt(T), p = this.pieces[k];
-    if (!p?.ready || !p.tl) return;
-    this.loading = true;
-    try {
-      if (!audio.src.endsWith(p.url)) await this.load(p.url);
-      this.piece = k;
-      audio.currentTime = Math.max(0, T - p.start);
-    } finally { this.loading = false; }
+    // loads the audio around T (and plays it if asked), so a later tap on play starts instantly, inside the tap (iOS)
+    await this.seek(T, !!autoplay || (same && !audio.paused));
   },
 
-  // ---------- pieces & time
-  async loadPieces() {
-    const ch = this.ch;
-    if (ch.full) {
-      const tl = await api(`/api/books/${this.book.id}/chapters/${ch.index}/timeline`);
-      if (this.localURL) URL.revokeObjectURL(this.localURL);
-      this.localURL = await offline.audioURL(this.book.id, ch.index);        // on the phone: no data, no buffering
-      this.pieces = [{ url: this.localURL || `/api/books/${this.book.id}/chapter-audio/${ch.index}.m4a`, start: 0, dur: tl.duration, tl, ready: true }];
-      tl.units.forEach((u) => this.wordify(u, 0));
-    } else {
-      let start = 0;
-      this.pieces = ch.segments.map((s, k) => {
-        const p = { url: `/api/books/${this.book.id}/audio/${ch.index}/${k}.m4a`, start, dur: s.est, tl: null, ready: s.ready, u0: s.u0, u1: s.u1, k };
-        start += s.est;
-        return p;
-      });
-      await Promise.all(this.pieces.filter((p) => p.ready).map((p) => this.loadPieceTimeline(p).catch(() => {})));
-      this.restack();
-    }
+  // ---------- the stream
+  newTape() {
+    if (this.tape) { this.tape.gen++; this.tape.ctl?.abort(); URL.revokeObjectURL(this.tape.url); this.tape = null; }
+    if (!MSE || !MSE.isTypeSupported?.(MIME)) return;
+    const ms = new MSE();
+    const tp = { ms, sb: null, url: URL.createObjectURL(ms), anchors: [], cur: null, end: 0, top: 0, gen: 0, eos: false, queued: false, ctl: null, blocked: null };
+    tp.q = new Promise((res) => ms.addEventListener("sourceopen", () => {
+      tp.sb = ms.addSourceBuffer(MIME);
+      tp.sb.mode = "sequence";       // each new file continues exactly where the previous one ended
+      tp.sb.addEventListener("bufferedchange", () => this.pump());    // ManagedMediaSource evicted something
+      res();
+    }, { once: true }));
+    ms.addEventListener("startstreaming", () => this.pump());
+    if (window.ManagedMediaSource && MSE === window.ManagedMediaSource) audio.disableRemotePlayback = true;   // required by ManagedMediaSource
+    audio.src = tp.url;
+    this.mediaErrors = 0;
+    this.tape = tp;
   },
-  async loadPieceTimeline(p) {
-    if (p.tl) return p.tl;
-    p.tl = await api(`/api/books/${this.book.id}/chapters/${this.ch.index}/segments/${p.k}`);
-    p.ready = true;
-    p.dur = p.tl.duration;
-    return p.tl;
-  },
-  restack() {   // recompute piece start times once real durations are known
-    let start = 0;
-    for (const p of this.pieces) {
-      p.start = start;
-      if (p.tl && !p.wordified) { p.tl.units.forEach((u) => this.wordify(u, 0)); p.wordified = true; }
-      start += p.dur;
+
+  // chapter n: its text and its audio files ("full" once the chapter is rendered, else its render pieces)
+  async entry(n, reload = false) {
+    const old = this.chs.get(n);
+    if (old && !reload) return old;
+    const c = await api(`/api/books/${this.book.id}/chapters/${n}`);
+    const e = { n, c, files: c.full ? [{ n, part: "full", ready: true, dur: 0 }]
+      : c.segments.map((s, k) => ({ n, part: k, ready: s.ready, dur: s.est, u0: s.u0, u1: s.u1 })) };
+    for (const f of e.files) {       // keep fragment tables already loaded (unless that audio was rebuilt since)
+      const o = !old?.stale && old?.files.find((x) => x.part === f.part);
+      if (o?.idx) Object.assign(f, { idx: o.idx, dur: o.dur, ready: true, init: o.init, blob: o.blob });
     }
+    await Promise.all(e.files.filter((f) => f.ready && !f.idx).map((f) => this.loadFile(f).catch(() => {})));
+    this.chs.set(n, e);
+    const sig = (ch) => ch.units.map((u) => `${u.block}:${u.start}`).join();
+    if (this.root && this.ch?.index === n && sig(this.ch) !== sig(c)) { this.ch = c; this.render(); }   // re-segmented meanwhile
+    this.relayout(e);
+    return e;
   },
-  async refreshReadiness() {
-    const c = await api(`/api/books/${this.book.id}/chapters/${this.ch.index}`).catch(() => null);
-    if (!c) return;
-    if (c.full && !this.ch.full && audio.paused) {   // chapter finished rendering while we weren't playing: switch to the one-file version
-      const T = this.chapterTime(); this.ch.full = true; await this.loadPieces(); this.piece = -1; this.startT = T; this.paintScrub(); return;
-    }
-    c.segments.forEach((s, k) => { if (this.pieces[k] && !this.pieces[k].ready && s.ready) this.pieces[k].ready = true; });
-    await Promise.all(this.pieces.filter((p) => p.ready && !p.tl && p.k != null).map((p) => this.loadPieceTimeline(p).catch(() => {})));
-    this.restack();
+  async loadFile(f) {
+    const ix = await api(`/api/books/${this.book.id}/stream/${f.n}/${f.part}.json`);
+    Object.assign(f, { idx: ix, ready: true, dur: ix.duration });
+    return f;
+  },
+  // a chapter still rendering: pick up newly rendered pieces in place (anchors keep pointing at the same files)
+  async refresh(n) {
+    const e = this.chs.get(n);
+    if (!e || e.c.full) return;
+    const c = await api(`/api/books/${this.book.id}/chapters/${n}`);
+    c.segments.forEach((s, k) => { if (e.files[k] && s.ready) e.files[k].ready = true; });
+    await Promise.all(e.files.filter((f) => f.ready && !f.idx).map((f) => this.loadFile(f).catch(() => {})));
+    this.relayout(e);
+  },
+  relayout(e) {      // file start offsets and the chapter's unit/word times, once real durations are known
+    let t = 0;
+    for (const f of e.files) { f.offset = t; t += f.dur || 0; }
+    e.total = t;
+    e.units = [];
+    for (const f of e.files) if (f.idx) for (const u of f.idx.units) e.units.push({ i: u.i, t0: u.t0 + f.offset, t1: u.t1 + f.offset,
+      words: (u.words || []).map(([a, b, w0, w1]) => [a, b, w0 + f.offset, w1 + f.offset]) });
+    if (this.ch && e.n === this.ch.index) this.layout();
+  },
+  layout() {         // the current chapter's timing changed: unit times, and on the reader its word spans and scrubber
+    const e = this.chs.get(this.ch.index);
+    this.ut = e?.units || [];
+    if (!this.root) return;
+    for (const u of this.ut) this.wordify(u);
     this.paintScrub();
   },
-  pieceAt(T) {
-    let k = this.pieces.findLastIndex((p) => p.start <= T + 1e-6);
-    return Math.max(0, k);
+  nextChapter(n) {
+    const chs = this.book.chapters.filter((c) => c.include && c.n_units);
+    const k = chs.findIndex((c) => c.index === n);
+    return k >= 0 && k + 1 < chs.length ? chs[k + 1].index : null;
   },
-  unitsWithTimes() {   // [{i, t0, t1, words, piece}] in chapter time, for every rendered unit
-    const out = [];
-    for (const p of this.pieces) if (p.tl) for (const u of p.tl.units) out.push({ ...u, t0: u.t0 + p.start, t1: u.t1 + p.start, off: p.start });
-    return out;
+  fileAt(e, t) {
+    const k = e.files.findIndex((f) => t < f.offset + (f.dur || 0));
+    return k < 0 ? e.files.length - 1 : k;
+  },
+
+  // stream time -> {n: chapter, t: seconds into it}
+  map(T) {
+    const tp = this.tape;
+    let a = null;
+    for (const x of tp?.anchors || []) { if (x.tape <= T + 1e-3) a = x; else break; }
+    const f = a && this.chs.get(a.n)?.files[a.fi];
+    if (!f) return null;
+    const ft = a.ft + (T - a.tape);
+    return { n: a.n, t: f.offset + Math.min(ft, f.dur || ft) };
+  },
+  // chapter n at t s -> stream time, if that audio is buffered right now
+  tapeFor(n, t) {
+    const tp = this.tape, e = this.chs.get(n);
+    if (!tp?.sb || !e) return null;
+    const fi = this.fileAt(e, t), f = e.files[fi];
+    const a = tp.anchors.find((x) => x.n === n && x.fi === fi);
+    if (!a || t - f.offset < a.ft - 0.01) return null;
+    const T = a.tape + (t - f.offset - a.ft);
+    return this.buffered(T) ? T : null;
+  },
+  buffered(T, margin = 0.3) {
+    const b = this.tape?.sb?.buffered;
+    if (b) for (let i = 0; i < b.length; i++) if (b.start(i) - 0.1 <= T && T < b.end(i) - margin) return true;
+    return false;
+  },
+  aheadOf(T) {
+    const b = this.tape?.sb?.buffered;
+    if (b) for (let i = 0; i < b.length; i++) if (b.start(i) - 0.1 <= T && T <= b.end(i)) return b.end(i) - T;
+    return 0;
+  },
+
+  // every SourceBuffer operation runs through this queue, one at a time
+  exclusive(fn) {
+    const tp = this.tape;
+    const run = tp.q.then(fn);
+    tp.q = run.catch(() => {});
+    return run;
+  },
+  pump() {
+    const tp = this.tape;
+    if (!tp || tp.queued || !tp.cur || tp.eos || this.target) return;   // a pending jump does its own appending
+    tp.queued = true;
+    this.exclusive(async () => { tp.queued = false; await this.fill(tp, tp.gen); }).catch((e) => this.pumpFailed(tp, e));
+  },
+  // append until AHEAD seconds are buffered past the playhead; with `batches`, append exactly that many and stop
+  async fill(tp, gen, batches = 0) {
+    for (let k = 0; gen === tp.gen && tp.cur && !tp.eos; k++) {
+      if (batches && k >= batches) return;
+      if (!batches) {
+        const ahead = this.aheadOf(audio.currentTime);
+        if (ahead > AHEAD || (tp.ms.streaming === false && ahead > 15)) return;   // ManagedMediaSource: "enough for now"
+      }
+      const step = await this.nextBatch(tp, gen);
+      if (!step || gen !== tp.gen) return;
+      await this.appendBatch(tp, gen, step);
+      this.retry = 0;
+    }
+  },
+  async nextBatch(tp, gen) {
+    for (;;) {
+      const c = tp.cur, e = (!this.chs.get(c.n)?.stale && this.chs.get(c.n)) || await this.entry(c.n, true);
+      if (gen !== tp.gen) return null;
+      const file = e.files[c.fi];
+      if (!file) {                   // past the chapter's last file: carry on with the next chapter
+        const nx = this.nextChapter(c.n);
+        if (nx == null || !prefs.autoNext) { this.endStream(tp); return null; }
+        await this.entry(nx);
+        tp.cur = { n: nx, fi: 0, f: 0, fresh: true };
+        continue;
+      }
+      if (!file.idx) {
+        if (!file.ready) await this.refresh(c.n);
+        if (!file.ready) { tp.blocked = file; this.awaitRender(file); return null; }
+        await this.loadFile(file);
+        this.relayout(e);
+      }
+      tp.blocked = null;
+      const fr = file.idx.frags;
+      if (c.f >= fr.length) { tp.cur = { n: c.n, fi: c.fi + 1, f: 0, fresh: true }; continue; }
+      let j = c.f + 1;
+      while (j < fr.length && fr[j][0] + fr[j][1] - fr[c.f][0] <= BATCH) j++;
+      return { e, file, f0: c.f, f1: j };
+    }
+  },
+  async appendBatch(tp, gen, { e, file, f0, f1 }) {
+    const fr = file.idx.frags;
+    const data = await this.read(tp, file, fr[f0][0], fr[f1 - 1][0] + fr[f1 - 1][1]);
+    if (gen !== tp.gen) return;
+    if (tp.cur.fresh) {              // a new file: its init segment, and an anchor where its audio starts
+      file.init ||= await this.read(tp, file, file.idx.init[0], file.idx.init[1]);
+      if (gen !== tp.gen) return;
+      await this.append(tp, file.init);
+      tp.anchors.push({ tape: tp.end, n: file.n, fi: e.files.indexOf(file), ft: fr[f0][2] });
+      tp.cur.fresh = false;
+    }
+    try { await this.append(tp, data); }
+    catch (err) {                    // buffer full (iOS keeps it small): drop more of what was already played, retry once
+      if (err.name !== "QuotaExceededError") throw err;
+      await this.trim(tp, 5);
+      await this.append(tp, data);
+    }
+    tp.cur.f = f1;
+    const b = tp.sb.buffered;
+    if (b.length) { tp.end = b.end(b.length - 1); tp.top = Math.max(tp.top, tp.end); }
+    await this.trim(tp);
+  },
+  async read(tp, file, a, b) {
+    if (file.part === "full" && offline.version(this.book.id, file.n) === file.idx.v) {   // downloaded: no network
+      file.blob ||= await offline.blob(this.book.id, file.n);
+      if (file.blob) return file.blob.slice(a, b).arrayBuffer();
+    }
+    tp.ctl = new AbortController();
+    const r = await fetch(`/api/books/${this.book.id}/stream/${file.n}/${file.part}.mp4?v=${file.idx.v}`,
+      { headers: { range: `bytes=${a}-${b - 1}` }, signal: tp.ctl.signal });
+    if (r.status === 410 || r.status === 404) {   // rebuilt or gone since we loaded its table (new voice, pipeline upgrade)
+      const e = this.chs.get(file.n);
+      if (e) e.stale = true;
+      throw Object.assign(new Error(`audio was rebuilt (${r.status})`), { name: "Stale" });
+    }
+    if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { name: r.status >= 500 ? "Server" : "Http" });
+    const buf = await r.arrayBuffer();
+    return r.status === 206 ? buf : buf.slice(a, b);
+  },
+  append(tp, buf) {
+    return new Promise((res, rej) => {
+      const sb = tp.sb;
+      const off = () => { sb.removeEventListener("updateend", ok); sb.removeEventListener("error", bad); };
+      const ok = () => { off(); res(); }, bad = () => { off(); rej(new Error("append failed")); };
+      sb.addEventListener("updateend", ok); sb.addEventListener("error", bad);
+      try { sb.appendBuffer(buf); } catch (e) { off(); rej(e); }
+    });
+  },
+  sbDo(tp, fn) {
+    return new Promise((res) => {
+      const ok = () => { tp.sb.removeEventListener("updateend", ok); res(); };
+      tp.sb.addEventListener("updateend", ok);
+      try { fn(); } catch { tp.sb.removeEventListener("updateend", ok); res(); }
+    });
+  },
+  async trim(tp, keep = BEHIND) {
+    const b = tp.sb.buffered, cut = audio.currentTime - keep;
+    if (b.length && b.start(0) < cut - (keep === BEHIND ? 20 : 0)) await this.sbDo(tp, () => tp.sb.remove(b.start(0), cut));
+  },
+  endStream(tp) {
+    tp.eos = true; tp.cur = null;
+    if (tp.ms.readyState === "open" && !tp.sb.updating) try { tp.ms.endOfStream(); } catch {}
+  },
+  // move the stream to chapter n at t s: drop the buffer and append from there.
+  // "ok", "stale" (a newer jump took over) or "pending" (that part isn't rendered yet)
+  rebase(n, t) {
+    const tp = this.tape;
+    const gen = ++tp.gen;
+    tp.ctl?.abort();
+    tp.anchors = [];                 // until the new audio is in, the UI shows the target (startT)
+    return this.exclusive(async () => {
+      if (gen !== tp.gen) return "stale";
+      const e = await this.entry(n, true);
+      if (gen !== tp.gen) return "stale";
+      const fi = this.fileAt(e, t), file = e.files[fi];
+      if (!file.ready) return "pending";
+      if (!file.idx) { await this.loadFile(file); this.relayout(e); }
+      if (gen !== tp.gen) return "stale";
+      const fr = file.idx.frags, ft = t - file.offset;
+      const sb = tp.sb;
+      if (tp.ms.readyState === "open") try { sb.abort(); } catch {}
+      if (sb.buffered.length) await this.sbDo(tp, () => sb.remove(0, tp.top + 3600));
+      const P = Math.ceil(tp.top) + 1;              // stream time only grows: anchors never overlap
+      sb.timestampOffset = P;
+      Object.assign(tp, { end: P, top: P, eos: false, cur: { n, fi, f: Math.max(0, fr.findLastIndex((x) => x[2] <= ft - LEAD)), fresh: true } });
+      for (let k = 0; k < 4 && gen === tp.gen && this.tapeFor(n, t) == null && tp.cur; k++) await this.fill(tp, gen, 1);
+      if (gen !== tp.gen) return "stale";
+      const T = this.tapeFor(n, t);
+      if (T == null) throw new Error("couldn't load audio");
+      audio.currentTime = T;
+      return "ok";
+    }).finally(() => this.pump());
+  },
+  awaitRender(file) {
+    clearTimeout(this.pollTimer);
+    api(`/api/books/${this.book.id}/focus`, { method: "POST", body: JSON.stringify({ chapter: file.n, unit: file.u0 ?? 0 }) }).catch(() => {});
+    this.pollTimer = setTimeout(async () => { if (this.tape) { await this.refresh(file.n).catch(() => {}); this.pump(); } }, 4000);
+  },
+  pumpFailed(tp, e) {
+    if (e?.name === "AbortError" || tp !== this.tape) return;
+    clog("stream-error", `${e?.name}: ${e?.message}`);
+    clearTimeout(this.retryTimer);
+    if (e?.name === "Stale") {        // that audio was rebuilt: stop appending it, reload the chapter where we are
+      tp.gen++;                       // anything still in flight for the old audio is dropped
+      tp.cur = null;
+      this.target ||= { n: this.ch.index, t: this.chapterTime(), play: !audio.paused || !this.userPaused };
+      this.retryTimer = setTimeout(() => this.recover(true), 300);
+      return;
+    }
+    if (e?.name === "QuotaExceededError") { this.retryTimer = setTimeout(() => this.recover(), 3000); return; }
+    const affected = this.target || this.state === "loading" || (!audio.paused && this.aheadOf(audio.currentTime) < 8);
+    if (!navigator.onLine && affected) { this.target = null; return this.setState("error", "You're offline and this part isn't downloaded"); }
+    if (this.retry >= 6 && affected) {           // ~1 min of trying: stop and say so; play tries again
+      this.target = null; this.retry = 0;
+      this.holding = true; audio.pause(); this.holding = false;
+      return this.setState("error", "Can't reach the reader server · tap play to try again");
+    }
+    const wait = Math.min(20000, 1500 * 2 ** this.retry++);
+    if (affected) this.setState("loading", e?.name === "Server" || e?.status >= 500 ? "The server is restarting · one moment" : `Connection lost · retrying in ${Math.round(wait / 1000)} s`);
+    this.retryTimer = setTimeout(() => this.recover(), wait);
+  },
+  // after a failure: finish the jump that was interrupted, or get the playhead back onto audio, or just keep buffering
+  recover(force = false) {
+    const tp = this.tape;
+    if (!tp) return;
+    const w = this.target;
+    clog("recover", w ? `jump to ${Math.round(w.t)}` : force ? "reload" : "pump");
+    if (w && w.n === this.ch.index) return this.seek(w.t, w.play, undefined, force);
+    if (force || (!audio.paused && !this.buffered(audio.currentTime, 0.05) && !tp.blocked)) return this.seek(this.chapterTime(), !audio.paused || !this.userPaused, undefined, true);
+    this.pump();
+  },
+  // the playhead ran out of audio
+  onStall() {
+    clearTimeout(this.stallTimer);
+    this.stallAt = Date.now();
+    this.stallTimer = setTimeout(() => {      // short stalls (a seek, a fragment boundary) never show
+      const tp = this.tape;
+      if (!tp || audio.paused || this.userPaused || audio.readyState >= 3) return;
+      if (tp.blocked) { clog("stall", "waiting for render"); return this.showWaiting(tp.blocked, "ahead"); }
+      if (this.state === "playing") this.setState("loading");             // buffering: show it
+      if (!this.buffered(audio.currentTime, 0.05) && !tp.queued) {     // evicted or a gap: pick up where we are
+        clog("stall", `no audio at the playhead (ahead ${this.aheadOf(audio.currentTime).toFixed(1)} s)`);
+        const m = this.map(audio.currentTime);
+        this.seek(m ? m.t : this.chapterTime(), true, undefined, true);
+      }
+    }, 1500);
+  },
+  onMediaError() {
+    if (!this.tape || audio.src !== this.tape.url) return;
+    // the stream broke (a decode error): start a fresh one at the same place
+    clog("media-error", `${audio.error?.code} ${audio.error?.message || ""}`);
+    if (++this.mediaErrors > 3) return this.setState("error", "Playback failed · reopen the chapter");
+    const T = this.chapterTime(), play = !this.userPaused, errs = this.mediaErrors;
+    this.newTape();
+    this.mediaErrors = errs;
+    this.seek(T, play);
+  },
+  // the playhead crossed into the next chapter: show it (synchronous: its data was fetched when it was appended)
+  enterChapter(n) {
+    const e = this.chs.get(n);
+    if (!e) return;
+    this.ch = e.c; this.cur = -1; this.curWord = null; this.clauses = new Map();
+    clog("chapter", `entered ${n}`);
+    if (this.root) {
+      this.render();
+      this.layout();
+      this.speed(audio.playbackRate);
+      this.setPlayIcon(audio.paused);
+      history.replaceState(null, "", `#/read/${this.book.id}/${n}`);
+    } else this.layout();
+    this.media();
+    this.paintMini();
+    this.save();
+    setTimeout(() => offline.sync(this.book.id), 5000);
+  },
+
+  // ---------- time
+  // a saved position -> chapter time. Positions name their sentence by its place in the text, so they survive a
+  // pipeline upgrade (new sentence numbers) and a re-render (new timings); older ones only have unit + seconds.
+  resolve(pos) {
+    if (pos.block == null) return pos.t ?? this.timeOfUnit(pos.unit);
+    const i = this.ch.units.findIndex((u) => u.block === pos.block && u.start <= pos.start && pos.start < Math.max(u.end, u.start + 1));
+    if (i < 0) return this.timeOfUnit(pos.unit);
+    const ut = this.ut.find((x) => x.i === i);
+    return this.timeOfUnit(i) + (i === pos.unit && ut ? Math.min(pos.du || 0, ut.t1 - ut.t0) : 0);
   },
   unitAtTime(T) {
-    const us = this.unitsWithTimes();
-    return us.findLast((u) => u.t0 <= T + 0.02) || us[0];
+    const us = this.ut;
+    let lo = 0, hi = us.length - 1, k = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (us[mid].t0 <= T + 0.02) { k = mid; lo = mid + 1; } else hi = mid - 1; }
+    return us[Math.max(0, k)];
   },
   timeOfUnit(i) {
-    const u = this.unitsWithTimes().find((x) => x.i === i);
+    const u = this.ut.find((x) => x.i === i);
     if (u) return u.t0;
-    const p = this.pieces.find((q) => q.u0 != null && q.u0 <= i && i < q.u1);
-    return p ? p.start : 0;
+    const f = this.chs.get(this.ch.index)?.files.find((q) => q.u0 != null && q.u0 <= i && i < q.u1);
+    return f ? f.offset : 0;
   },
   // go back `sec`, then land on a natural break in the speech (a pause between words), never mid-word
   snapBack(T, sec) {
     if (!sec) return T;
     const target = Math.max(0, T - sec);
     const words = [];
-    for (const u of this.unitsWithTimes()) for (const w of u.words || []) words.push([w[2] + u.off, w[3] + u.off]);
+    for (const u of this.ut) for (const w of u.words || []) words.push([w[2], w[3]]);
     let best = null;
     for (let j = 1; j < words.length; j++) {
       const gapStart = words[j - 1][1], next = words[j][0];
@@ -670,14 +1028,15 @@ const player = {
     return Math.max(0, best - 0.08);
   },
   chapterTime() {
-    if (this.piece < 0) return this.startT || 0;
-    return this.pieces[this.piece].start + (audio.currentTime || 0);
+    const m = this.tape && this.map(audio.currentTime);
+    return m && m.n === this.ch?.index ? m.t : this.startT || 0;
   },
-  chapterTotal() { return this.pieces.reduce((a, p) => a + p.dur, 0); },
+  chapterTotal() { return this.chs.get(this.ch?.index)?.total || 0; },
 
   // ---------- DOM
   render() {
     const b = this.book, ch = this.ch;
+    this.clauses = new Map(); this.curClause = null;
     const top = h("header", { class: "top reader-top" }, h("div", { class: "wrap" },
       h("a", { class: "iconbtn", href: `#/book/${b.id}`, title: b.title, html: ICON.back }),
       h("div", { class: "titles" }, h("div", { class: "kicker" }, b.title), h("div", { class: "ttl" }, chapterLabel(ch.title, b.lang))),
@@ -792,14 +1151,26 @@ const player = {
     if (!u.words?.length) return;
     const meta = this.ch.units[u.i], text = this.ch.blocks[meta.block].text;
     span.replaceChildren();
-    let pos = meta.start;
-    const put = (s) => s.split("\n").forEach((part, k) => { if (k) span.append(h("br")); if (part) span.append(part); });
+    let pos = meta.start, target = span, since = 0;
+    const put = (s) => s.split("\n").forEach((part, k) => { if (k) target.append(h("br")); if (part) target.append(part); });
+    // a long sentence is split into clauses (at , ; : dashes and brackets, at least 4 words each): the highlight and
+    // the ‹ › buttons then move by clause instead of by a whole screen of text
+    const long = meta.end - meta.start > 260 && u.words.length > 30;
+    const starts = [], els = [];
+    const clause = (k) => { target = h("span", { class: "c" }); span.append(target); starts.push(k); els.push(target); since = 0; };
+    if (long) { span.classList.add("long"); clause(0); }
     u.words.forEach(([s, e], k) => {
-      if (s > pos) put(text.slice(pos, s));
-      span.append(h("span", { class: "w", "data-k": k }, text.slice(s, e)));
+      if (s > pos) {
+        const gap = text.slice(pos, s);
+        if (long && k > 0 && since >= 4 && /[,;:—–()]/.test(gap)) { put(gap.replace(/\s+$/, "")); span.append(gap.match(/\s*$/)[0]); clause(k); }
+        else put(gap);
+      }
+      target.append(h("span", { class: "w", "data-k": k }, text.slice(s, e)));
+      since++;
       pos = e;
     });
     if (pos < meta.end) put(text.slice(pos, meta.end));
+    if (long) this.clauses.set(u.i, { starts, els });
   },
 
   // ---------- playback
@@ -812,65 +1183,68 @@ const player = {
     this.positionState();
   },
   playUnit(i) { return this.seek(this.timeOfUnit(i), true, i); },
-  // the one place that moves the playhead: load the right piece, wait if it isn't rendered yet, then play
-  async seek(T, play = realPlaying(), unitHint) {
+  play() {
+    this.userPaused = false;
+    this.ownPlayAt = Date.now();
+    if (this.state !== "playing") this.setState("loading");
+    audio.play().catch((e) => {
+      if (e?.name === "AbortError") return;      // a newer play/pause replaced this one
+      clog("play-refused", e?.name);
+      this.setState("idle", e?.name === "NotAllowedError" ? "Tap play to start" : "Couldn't start playback · tap play to try again");
+    });
+    this.wake(true);
+  },
+  // the one place that moves the playhead (chapter time T in the shown chapter)
+  async seek(T, play = realPlaying(), unitHint, force = false) {
     clearTimeout(this.waiting); this.waiting = null;
-    T = Math.max(0, T);
-    let k = this.pieceAt(T);
-    if (unitHint != null && this.pieces[0].u0 != null) k = this.pieces.findIndex((p) => p.u0 <= unitHint && unitHint < p.u1);
-    const p = this.pieces[k];
-    if (!p.ready || !p.tl) await this.refreshReadiness();
-    if (!p.ready || !p.tl) {
-      audio.pause();
-      if (unitHint != null) this.setCurrent(unitHint);
-      api(`/api/books/${this.book.id}/focus`, { method: "POST", body: JSON.stringify({ chapter: this.ch.index, unit: p.u0 ?? 0 }) }).catch(() => {});
-      this.showWaiting(p);
-      this.setPlayIcon(false);
-      if (play) this.waiting = setTimeout(() => this.root && this.seek(unitHint != null ? this.timeOfUnit(unitHint) : T, true, unitHint), 3000);
+    if (unitHint != null) { T = this.timeOfUnit(unitHint); this.setCurrent(unitHint); }
+    T = Math.max(0, Math.min(T, Math.max(0, this.chapterTotal() - 0.05)));
+    this.startT = T;
+    this.stoppedAt = 0;               // an explicit move is not a "resume": no automatic rewind
+    if (!this.tape) return;
+    const n = this.ch.index;
+    this.target = { n, t: T, play };   // until this jump lands; a failure retries it (recover)
+    if (play && this.state !== "playing" && this.state !== "waiting") this.setState("loading");   // keep a countdown on screen
+    const at = force ? null : this.tapeFor(n, T);
+    if (at != null) {                 // already buffered: instant, and play() stays inside the user's tap (iOS)
+      this.target = null;
+      audio.currentTime = at;
+      if (play) this.play();
+      this.positionState();
+      this.pump();
       return;
     }
-    // where inside this file: for a tapped sentence, straight from the file's own timeline (no estimates involved)
-    const ut = unitHint != null ? p.tl.units.find((x) => x.i === unitHint) : null;
-    const rel = ut ? ut.t0 : T - p.start;
-    this.hideWaiting();
-    this.stoppedAt = 0;               // an explicit move is not a "resume": no automatic rewind
-    this.loading = true;
-    try {
-      if (this.piece !== k || !audio.src.endsWith(p.url)) {
-        await this.load(p.url);
-        this.piece = k;
-      }
-      audio.currentTime = Math.min(Math.max(0, rel), Math.max(0, p.dur - 0.05));
-      audio.playbackRate = store.get(`speed:${this.book.id}`, 1);
-    } finally { this.loading = false; }
-    if (unitHint != null) this.setCurrent(unitHint);
-    if (play) {
-      this.userPaused = false;
-      this.ownPlayAt = Date.now();
-      try { await audio.play(); } catch { this.$.status.replaceChildren(h("span", { class: "waiting" }, "Tap play to start")); }
-      this.wake(true);
+    let r;
+    try { r = await this.rebase(n, T); } catch (e) { this.pumpFailed(this.tape, e); return; }
+    if (r === "stale" || this.ch.index !== n) return;       // a newer jump took over
+    this.target = null;
+    this.pump();
+    if (r !== "ok") clog("seek", r);
+    if (r === "pending") {            // not rendered yet: wait for it, and make sure the renderer is on it
+      this.holding = true; audio.pause(); this.holding = false;
+      const e = this.chs.get(n), f = e.files[this.fileAt(e, T)];
+      this.awaitRender(f);
+      if (play) {
+        this.showWaiting(f, "this part");
+        this.waiting = setTimeout(() => this.tape && this.state === "waiting" && this.seek(unitHint != null ? this.timeOfUnit(unitHint) : T, true, unitHint), 3000);
+      } else this.setState("idle");
+      return;
     }
-    this.setPlayIcon(audio.paused);
-    this.prefetch(k + 1);
+    if (play) this.play();
+    else if (this.state !== "playing") this.setState("idle");
     this.positionState();
   },
-  load(url) {
-    const meta = (ms) => new Promise((res) => {
-      const done = (ok) => { clearTimeout(timer); audio.removeEventListener("loadedmetadata", onOk); res(ok); };
-      const onOk = () => done(true);
-      const timer = setTimeout(() => done(false), ms);
-      audio.addEventListener("loadedmetadata", onOk);
-    });
-    audio.src = url;
-    audio.load();
-    return meta(4000).then((ok) => ok || (audio.load(), meta(15000)));   // a stalled first load gets one retry
-  },
-  prefetch(k) {
-    const p = this.pieces[k];
-    if (p && p.ready) { this.loadPieceTimeline(p).then(() => this.restack()).catch(() => {}); fetch(p.url).catch(() => {}); }
-  },
   async toggle() {
-    if (this.waiting) { clearTimeout(this.waiting); this.waiting = null; this.$.status.textContent = ""; this.setPlayIcon(true); return; }
+    if (this.state === "loading" || this.state === "waiting") {      // tapping a spinner cancels what it waits for
+      clearTimeout(this.waiting); this.waiting = null;
+      clearTimeout(this.retryTimer); clearInterval(this.etaTimer);
+      this.target = null;
+      this.userPaused = true;
+      this.holding = true; audio.pause(); this.holding = false;
+      this.setState("idle");
+      this.note("Stopped");
+      return;
+    }
     if (!realPlaying()) {
       const away = this.stoppedAt ? Date.now() - this.stoppedAt : 0;
       const T = this.snapBack(this.chapterTime(), rewindFor(away));
@@ -881,60 +1255,150 @@ const player = {
       audio.pause();
     }
   },
-  showWaiting(p) {
-    const w = this.$.status;
-    if (!navigator.onLine) { w.replaceChildren(h("span", { class: "waiting" }, "You're offline and this part isn't downloaded")); return; }
-    const rate = this.lastRate || 1.2;
-    const secs = Math.max(10, Math.round((p.dur || 60) / rate));
-    w.replaceChildren(h("span", { class: "waiting" }, h("span", { class: "spinner" }), `Rendering this part · about ${secs < 60 ? secs + " s" : Math.round(secs / 60) + " min"}`));
-    api("/api/status").then((st) => { this.lastRate = st.worker.rate || this.lastRate; }).catch(() => {});
+  // `what`: "this part" (you jumped somewhere not rendered yet) or "ahead" (playback caught up with the renderer).
+  // The countdown comes from the renderer itself: which piece it is on, how many of its sentences are done, and its
+  // speed on fresh sentences. It only counts down (a new estimate can't make it jump around), and playback starts
+  // by itself when the piece lands.
+  showWaiting(f, what = "this part") {
+    if (!navigator.onLine) return this.setState("error", "You're offline and this part isn't downloaded");
+    if (this.book.render === false) {   // rendering was switched off for this book: listening means you want it
+      this.book.render = true;
+      api(`/api/books/${this.book.id}`, { method: "PATCH", body: JSON.stringify({ render: true }) }).catch(() => {});
+      toast("Rendering turned on for this book");
+    }
+    const key = f ? `${f.n}:${f.part}` : "?";
+    if (this.state === "waiting" && this.waitKey === key && this.etaTimer) return;   // already counting down for it
+    const label = what === "ahead" ? "Rendering ahead" : "Rendering this part";
+    const eta = { shown: null, at: 0 };
+    const show = (st) => {
+      if (this.state !== "waiting" || this.waitKey !== key) return;
+      const w = st?.worker || {}, job = w.job, speed = Math.max(w.speed || w.rate || 1, 0.3);
+      if (st?.settings?.paused)
+        return this.setState("waiting", "Rendering is paused", { label: "Resume", run: () => api("/api/system", { method: "PUT", body: JSON.stringify({ paused: false }) }).then(() => { eta.shown = null; this.note("Rendering resumed"); }).catch(() => {}) });
+      if (w.state === "error") return this.setState("waiting", `${label} · the renderer hit a problem, retrying`);
+      const k = this.chs.get(f?.n)?.files.findIndex((x) => x.part === f?.part) ?? -1;
+      const here = job && job.book === this.book.id && job.chapter === f?.n;
+      const mine = here && job.segment === k, past = here && job.segment > k;
+      let secs;
+      if (past) secs = 3;                                                  // done, being joined: the next check plays it
+      else if (mine && job.done > 0) {                                     // pace of this very piece so far
+        const per = (Date.now() / 1000 - job.started) / job.done;
+        secs = per * (job.units - job.done) + 3;
+      } else secs = ((mine ? job.est : f?.dur) || 30) / speed + (mine ? 3 : 8);
+      const now = Date.now();
+      if (eta.shown != null) {                       // count down; only a clear slowdown may raise it
+        const ticking = Math.max(2, eta.shown - (now - eta.at) / 1000);
+        secs = secs < ticking || secs > ticking + 20 ? secs : ticking;
+      }
+      eta.shown = secs; eta.at = now;
+      const progress = mine && job.units > 1 ? ` (${job.done} of ${job.units} sentences)` : "";
+      this.setState("waiting", `${label} · ${secs < 8 ? "a few seconds" : secs < 60 ? `about ${Math.ceil(secs / 5) * 5} s` : `about ${Math.round(secs / 60)} min`}${progress}`);
+    };
+    this.setState("waiting", `${label}…`);
+    this.waitKey = key;
+    clearInterval(this.etaTimer);
+    const poll = () => api("/api/status").then(show).catch(() => show(null));
+    poll();
+    this.etaTimer = setInterval(poll, 2500);
   },
-  hideWaiting() { if (this.$?.status) this.$.status.replaceChildren(); },
+  hideWaiting() { this.say(null); },
   async wake(on) {
     try {
       if (on && prefs.wake && "wakeLock" in navigator && !this.lock) this.lock = await navigator.wakeLock.request("screen");
       if (!on && this.lock) { await this.lock.release(); this.lock = null; }
     } catch { this.lock = null; }
   },
-  setPlayIcon(paused) { if (this.$?.play) this.$.play.innerHTML = paused ? ICON.play : ICON.pause; },
+  // What the player is doing, shown on the play button, the now-playing bar, the message pill and the lock screen.
+  //   idle     paused (play icon)
+  //   loading  getting audio ready (spinner; tapping it cancels)
+  //   playing  (pause icon)
+  //   waiting  that part is still being rendered (spinner + countdown; starts by itself; tapping cancels)
+  //   error    can't play right now (play icon + why; tapping play tries again)
+  // Every tap moves the state at once, before any network call, so the button always answers.
+  state: "idle",
+  setState(state, msg = null, action = null) {
+    // an error right after a tap still shows the spinner briefly, so the tap visibly did something
+    if (state === "error" && this.state === "loading" && Date.now() - (this.loadingAt || 0) < 400) {
+      clearTimeout(this.errorTimer);
+      this.errorTimer = setTimeout(() => this.state === "loading" && this.setState(state, msg, action), 400 - (Date.now() - this.loadingAt));
+      return;
+    }
+    if (state === "loading" && this.state !== "loading") this.loadingAt = Date.now();
+    this.state = state;
+    this.stateMsg = msg;
+    if (state !== "waiting") this.waitKey = null;
+    const busy = state === "loading" || state === "waiting";
+    const icon = state === "playing" ? ICON.pause : busy ? ICON.spin : ICON.play;
+    const label = { idle: "Play", loading: "Loading · tap to cancel", playing: "Pause", waiting: "Waiting for rendering · tap to cancel", error: "Try again" }[state];
+    for (const b of [this.$?.play, this.$mini?.play]) {
+      if (!b) continue;
+      b.innerHTML = icon;
+      b.classList.toggle("busy", busy);
+      b.setAttribute("aria-label", label);
+      b.title = label;
+    }
+    this.say(msg, action, busy && !this.$?.play?.isConnected);      // the play button already spins on the reader
+    if (this.$mini?.sub) this.$mini.sub.textContent = msg && state !== "playing" ? msg : chapterLabel(this.ch?.title, this.book?.lang);
+    try { if (navigator.mediaSession) navigator.mediaSession.playbackState = state === "playing" ? "playing" : "paused"; } catch {}
+  },
+  // the message pill above the player: text, an optional spinner and an optional button
+  say(msg, action = null, spinning = false) {
+    clearTimeout(this.sayTimer);
+    const w = this.$?.status;
+    if (!w) return;
+    if (!msg) return w.replaceChildren();
+    w.replaceChildren(h("span", { class: "waiting" + (w.textContent.startsWith(msg) ? " again" : ""), }, spinning ? h("span", { class: "spinner" }) : null, msg,
+      action ? h("button", { class: "pill-btn", onclick: (e) => { e.stopPropagation(); action.run(); } }, action.label) : null));
+  },
+  // a short note that goes away by itself
+  note(msg, ms = 2500) {
+    this.say(msg);
+    this.sayTimer = setTimeout(() => { if (this.state === "idle" || this.state === "playing") this.say(null); }, ms);
+  },
+  setPlayIcon(paused) { this.setState(paused ? "idle" : "playing"); },
+  // the now-playing bar on the other screens: what's playing, play/pause, tap to go back to the text
+  mini() {
+    this.$mini = null;
+    if (!this.tape || !this.book || !this.ch || this.root) return null;
+    const b = this.book;
+    const busy = this.state === "loading" || this.state === "waiting";
+    const play = h("button", { class: "mini-play" + (busy ? " busy" : ""), "aria-label": "Play or pause", html: this.state === "playing" ? ICON.pause : busy ? ICON.spin : ICON.play,
+      onclick: (e) => { e.preventDefault(); e.stopPropagation(); this.toggle(); } });
+    const sub = h("div", { class: "s" }, this.stateMsg && this.state !== "playing" ? this.stateMsg : chapterLabel(this.ch.title, b.lang));
+    const el = h("a", { class: "mini", href: `#/read/${b.id}/${this.ch.index}` }, coverEl(b), h("div", { class: "grow" }, h("div", { class: "t" }, b.title), sub), play);
+    this.$mini = { el, play, sub };
+    document.body.classList.add("has-mini");
+    return el;
+  },
+  paintMini() {
+    if (!this.$mini?.el.isConnected) return;
+    this.$mini.el.setAttribute("href", `#/read/${this.book.id}/${this.ch.index}`);
+    this.$mini.sub.textContent = chapterLabel(this.ch.title, this.book.lang);
+  },
   step(d) {
     const T = this.chapterTime();
     const u = this.unitAtTime(T);
     if (!u) return;
-    if (d < 0 && T - u.t0 > 1.5) return this.seek(u.t0, realPlaying());
+    const starts = (x) => (this.clauses.get(x?.i)?.starts || []).map((k) => x.words[k][2]);   // clause start times
+    const cs = starts(u);
+    if (d < 0) {
+      const back = cs.filter((t) => t < T - 1.5).pop();
+      if (back != null) return this.seek(back - 0.05, realPlaying());
+      if (T - u.t0 > 1.5) return this.seek(u.t0, realPlaying());
+    } else {
+      const fwd = cs.find((t) => t > T + 0.3);
+      if (fwd != null) return this.seek(fwd - 0.05, realPlaying());
+    }
     const i = Math.max(0, Math.min(this.ch.units.length - 1, u.i + d));
+    const prevLast = d < 0 ? starts(this.ut.find((x) => x.i === i)).pop() : null;     // back into a long sentence: its last clause
+    if (prevLast != null) return this.seek(prevLast - 0.05, realPlaying());
     this.seek(this.timeOfUnit(i), realPlaying(), i);
   },
   skip(dir) { this.seek(this.chapterTime() + dir * prefs.skip, realPlaying()); },
-
-  async onEnded() {
-    const k = this.piece + 1;
-    if (k < this.pieces.length) return this.seek(this.pieces[k].start, true);
-    // end of chapter: continue with the next one (unless switched off in settings)
-    if (!prefs.autoNext) { this.setPlayIcon(true); return; }
-    const chs = this.book.chapters.filter((c) => c.include && c.n_units);
-    const n = chs.findIndex((c) => c.index === this.ch.index);
-    if (n >= 0 && n + 1 < chs.length) {
-      positions.remember(this.book.id, { chapter: chs[n + 1].index, unit: 0, t: 0 });
-      positions.push(this.book.id);
-      setTimeout(() => offline.sync(this.book.id), 5000);
-      location.hash = `#/read/${this.book.id}/${chs[n + 1].index}/0?play`;
-    } else { this.setPlayIcon(true); toast("The end."); }
-  },
-
-  // network trouble (car, tunnel, metro): keep the place and retry with backoff
-  onError(stalled = false) {
-    // only network trouble is worth retrying; a decode error would just loop
-    // retry network trouble and server hiccups (a 5xx shows up as "not supported"); never loop on a local file
-    const code = audio.error?.code;
-    if (!this.root || this.userPaused || audio.src.startsWith("blob:")) return;
-    if (!stalled && code && code !== MediaError.MEDIA_ERR_NETWORK && code !== MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) return;
-    if (this.retry > 8) { this.$.status.replaceChildren(h("span", { class: "waiting" }, "Can't reach the server right now")); return; }
-    const T = this.chapterTime();
-    clearTimeout(this.retryTimer);
-    const wait = Math.min(30000, 2000 * 2 ** this.retry++);
-    this.$.status.replaceChildren(h("span", { class: "waiting" }, h("span", { class: "spinner" }), `Connection lost · retrying in ${Math.round(wait / 1000)} s`));
-    this.retryTimer = setTimeout(async () => { this.piece = -1; await this.seek(T, true); if (!audio.paused) { this.retry = 0; this.hideWaiting(); } }, wait);
+  // the stream only ends at the end of the book (or of the chapter, with "continue to the next chapter" off)
+  onEnded() {
+    this.setPlayIcon(true);
+    if (this.nextChapter(this.ch.index) == null) toast("The end.");
   },
 
   // ---------- highlight & time
@@ -956,31 +1420,42 @@ const player = {
     const tick = () => {
       if (!this.root) return;
       this.raf = requestAnimationFrame(tick);
-      if (this.piece < 0 || this.loading) return this.paintTime();
-      const p = this.pieces[this.piece];
-      if (!p?.tl) return this.paintTime();
-      const t = audio.currentTime;
-      const u = p.tl.units.findLast((x) => x.t0 <= t + 0.02) || p.tl.units[0];
-      if (u.i !== this.cur) { this.setCurrent(u.i); }
-      const words = u.words || [];
-      let k = -1;
-      for (let j = 0; j < words.length; j++) { if (words[j][2] <= t + 0.03) k = j; else break; }
-      const el = this.unitEls[u.i];
-      const w = k >= 0 && t <= words[k][3] + 0.25 ? el?.querySelectorAll(".w")[k] : null;
-      if (w !== this.curWord) { this.curWord?.classList.remove("cur"); w?.classList.add("cur"); this.curWord = w; }
-      // follow long sentences word by word
-      if (w && this.follow && !audio.paused) { const r = w.getBoundingClientRect(); if (r.bottom > innerHeight * 0.66 || r.top < innerHeight * 0.12) w.scrollIntoView({ behavior: "smooth", block: "center" }); }
-      this.paintTime();
+      this.update();
     };
     tick();
+  },
+  // called every frame on screen, and on every timeupdate when hidden (locked screen: no animation frames)
+  update() {
+    if (!this.tape || !this.ch) return;
+    const m = this.map(audio.currentTime);
+    if (m && m.n !== this.ch.index) return this.enterChapter(m.n);
+    if (!this.root) return;
+    if (m && this.dragT == null) {
+      const t = m.t, u = this.unitAtTime(t);
+      if (u) {
+        if (u.i !== this.cur) this.setCurrent(u.i);
+        const words = u.words || [];
+        let k = -1;
+        for (let j = 0; j < words.length; j++) { if (words[j][2] <= t + 0.03) k = j; else break; }
+        const el = this.unitEls[u.i];
+        const w = k >= 0 && t <= words[k][3] + 0.25 ? el?.querySelectorAll(".w")[k] : null;
+        if (w !== this.curWord) { this.curWord?.classList.remove("cur"); w?.classList.add("cur"); this.curWord = w; }
+        const cl = this.clauses.get(u.i);
+        const c = cl ? cl.els[Math.max(0, cl.starts.findLastIndex((s) => s <= Math.max(k, 0)))] : null;
+        if (c !== this.curClause) { this.curClause?.classList.remove("cur"); c?.classList.add("cur"); this.curClause = c; }
+        // follow long sentences word by word
+        if (w && this.follow && !audio.paused && !document.hidden) { const r = w.getBoundingClientRect(); if (r.bottom > innerHeight * 0.66 || r.top < innerHeight * 0.12) w.scrollIntoView({ behavior: "smooth", block: "center" }); }
+      }
+    }
+    this.paintTime();
   },
   paintTime() {
     if (!this.$?.elapsed) return;
     const total = this.chapterTotal(), rate = audio.playbackRate || 1;
     const t = this.dragT ?? this.chapterTime();
-    const exact = this.pieces.every((p) => p.tl);
+    const exact = (this.chs.get(this.ch.index)?.files || []).every((f) => f.idx);
     this.$.elapsed.textContent = fmt(t / rate);
-    this.$.remain.textContent = `−${exact ? "" : "~"}${fmt(Math.max(0, total - t) / rate)}`;
+    this.$.remain.textContent = `${exact ? "−" : "≈ "}${fmt(Math.max(0, total - t) / rate)}`;
     const f = Math.min(1, t / Math.max(total, 1));
     this.$.knob.style.left = `${100 * f}%`;
     if (this.$.played) this.$.played.style.width = `${100 * f}%`;
@@ -1011,22 +1486,27 @@ const player = {
   },
   paintScrub() {
     if (!this.$?.track) return;
-    const total = this.chapterTotal();
+    const e = this.chs.get(this.ch.index), total = this.chapterTotal();
     this.$.track.replaceChildren();
-    for (const p of this.pieces) if (p.ready) this.$.track.append(h("div", { class: "seg", style: `left:${(100 * p.start) / total}%;width:${(100 * p.dur) / total}%` }));
+    if (e && total) for (const f of e.files) if (f.ready) this.$.track.append(h("div", { class: "seg", style: `left:${(100 * f.offset) / total}%;width:${(100 * (f.dur || 0)) / total}%` }));
     this.$.played = h("div", { class: "played" });
     this.$.track.append(this.$.played);
   },
   save() {
-    if (!this.book || this.piece < 0) return;
-    const T = this.chapterTime();
-    positions.remember(this.book.id, { chapter: this.ch.index, unit: Math.max(this.cur, 0), t: T });
+    if (!this.book || !this.ch) return;
+    const m = this.tape && this.map(audio.currentTime);
+    if (!m || m.n !== this.ch.index) return;
+    const i = Math.max(this.cur, 0), u = this.ch.units[i], ut = this.ut.find((x) => x.i === i);
+    // where in the text, and how far into that sentence: survives re-segmentation and re-rendering
+    positions.remember(this.book.id, { chapter: m.n, unit: i, t: m.t, block: u?.block, start: u?.start, du: ut ? Math.max(0, m.t - ut.t0) : 0 });
     positions.push(this.book.id);
   },
   positionState() {
-    if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState || this.piece < 0) return;
-    const p = this.pieces[this.piece];
-    try { navigator.mediaSession.setPositionState({ duration: Math.max(p.dur, 0.1), position: Math.min(audio.currentTime || 0, p.dur), playbackRate: audio.playbackRate || 1 }); } catch {}
+    const s = navigator.mediaSession;
+    if (!s || !this.ch) return;
+    const dur = Math.max(this.chapterTotal(), 0.1);
+    try { s.setPositionState?.({ duration: dur, position: Math.min(Math.max(0, this.chapterTime()), dur), playbackRate: audio.playbackRate || 1 }); } catch {}
+    try { s.playbackState = audio.paused ? "paused" : "playing"; } catch {}
   },
   media() {
     if (!("mediaSession" in navigator)) return;
@@ -1036,36 +1516,37 @@ const player = {
     set("play", () => this.toggle()); set("pause", () => this.toggle());
     set("previoustrack", () => this.step(-1)); set("nexttrack", () => this.step(1));
     set("seekbackward", () => this.skip(-1)); set("seekforward", () => this.skip(1));
-    set("seekto", (d) => this.seek((this.pieces[this.piece]?.start || 0) + d.seekTime, realPlaying()));
+    set("seekto", (d) => this.seek(d.seekTime, realPlaying()));
+    this.positionState();
   },
 };
 
-audio.addEventListener("ended", () => player.root  && player.onEnded());
-audio.addEventListener("error", () => player.onError());
-// a stall that never recovers (lost coverage mid-file) is handled like a network error
-let stallTimer = 0;
-audio.addEventListener("waiting", () => { clearTimeout(stallTimer); stallTimer = setTimeout(() => { if (player.root && !player.userPaused && audio.readyState < 3) player.onError(true); }, 12000); });
-audio.addEventListener("playing", () => clearTimeout(stallTimer));
-audio.addEventListener("play", () => { player.setPlayIcon(false); });
-audio.addEventListener("playing", () => { player.retry = 0; if (player.$?.status && /retrying|reach/.test(player.$.status.textContent)) player.hideWaiting(); });
+audio.addEventListener("ended", () => player.tape && player.onEnded());
+audio.addEventListener("error", () => player.onMediaError());
+audio.addEventListener("waiting", () => player.tape && player.onStall());
+audio.addEventListener("timeupdate", () => { player.pump(); if (document.hidden) player.update(); });
+audio.addEventListener("playing", () => { clearTimeout(player.stallTimer); clearInterval(player.etaTimer); player.retry = 0; player.setState("playing"); player.positionState(); });
+audio.addEventListener("seeked", () => player.positionState());
 audio.addEventListener("pause", () => {
   player.wake(false);
-  player.setPlayIcon(true);
-  if (!player.root || audio.ended) return;
+  if (!player.holding && player.state !== "error") player.setState("idle");      // holding: we paused to wait, the state says why
+  player.positionState();
+  if (!player.tape || audio.ended) return;
   player.stoppedAt = Date.now();     // user pause *or* a system interruption (call, Siri, navigation)
   player.save();
 });
 audio.addEventListener("ratechange", () => player.positionState());
 // stopped by the system and resumed by the system (no tap): still go back a bit
 audio.addEventListener("play", () => {
-  if (!player.root || !player.stoppedAt || player.loading || Date.now() - (player.ownPlayAt || 0) < 2000) return;
+  if (!player.tape || !player.stoppedAt || Date.now() - (player.ownPlayAt || 0) < 2000) return;
   const away = Date.now() - player.stoppedAt;
   player.stoppedAt = 0;
   const back = rewindFor(away);
   if (back) { const T = player.snapBack(player.chapterTime(), back); player.seek(T, true); }
 });
-setInterval(() => { if (player.root && !audio.paused) player.save(); }, 5000);
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") player.save(); });
+setInterval(() => { if (player.tape && !audio.paused) player.save(); }, 5000);
+document.addEventListener("visibilitychange", () => { clog("visibility", document.visibilityState); if (document.visibilityState === "hidden") player.save(); else player.update(); });
+clog("start", `${navigator.userAgent.slice(0, 120)} · ${matchMedia("(display-mode: standalone)").matches ? "installed" : "browser"} · ${MSE === window.MediaSource ? "MediaSource" : "ManagedMediaSource"}`);
 
 addEventListener("keydown", (e) => {
   if (!player.root || e.target.closest("input,select,textarea")) return;
@@ -1078,6 +1559,7 @@ addEventListener("keydown", (e) => {
 async function route() {
   const [path, query] = location.hash.slice(1).split("?");
   const parts = (path || "/").split("/").filter(Boolean);
+  document.body.classList.remove("has-mini");
   document.querySelectorAll(".sheet, .toast").forEach((el) => el.remove());
   if (parts[0] !== "read") scrollTo(0, 0);
   try {

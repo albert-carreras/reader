@@ -11,9 +11,31 @@ from pathlib import Path
 
 from . import library as lib
 from . import timing
+from .engine import synth_job as _synth_job
+from .render import ctx_id, final_audio, render_unit, unit_key
 from .segment import Unit
 
 log = logging.getLogger("reader.worker")
+
+
+def mem_available_gb() -> float:
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1e6
+    except OSError:
+        pass
+    return 99.0
+
+
+SIDE_LANE_MIN_GB, SIDE_LANE_STOP_GB = 4.5, 2.0    # a side lane costs ~2 GB (one more Pocket process + its alignments)
+
+
+def lanes_for(threads: int) -> int:
+    """How many chapters render at once (CPU setting Low / Medium / High). Lane 0 always follows the listener;
+    the others take whole later chapters, which need no context from before (a chapter starts fresh)."""
+    return 1 if threads <= 2 else 2 if threads <= 4 else 3
+IDLE_RELEASE_S = float(os.environ.get("READER_IDLE_RELEASE", "300"))   # unload models after this long with nothing to do
 
 
 def _unit(c: dict, i: int) -> Unit:
@@ -46,8 +68,15 @@ class Worker(threading.Thread):
         super().__init__(daemon=True, name="render-worker")
         self.focus: tuple[str, int, int] | None = None     # (book, chapter, unit index)
         self.wake = threading.Event()
-        self.status = dict(state="idle", job=None, rate=None, error=None, rendered_secs=0.0)
+        self.status = dict(state="idle", job=None, rate=None, error=None, rendered_secs=0.0, lanes=[])
         self._stats = {}
+        self.claims: dict[tuple[str, int], int] = {}        # (book, chapter) -> side lane rendering it
+        self.claims_lock = threading.Lock()
+        self.lane0_at: tuple[str, int] | None = None       # the chapter lane 0 is on
+        self.lane_jobs: dict[int, dict] = {}                # side lane -> what it's doing (for the app)
+        self.side_wanted = 0
+        self._side: dict[int, threading.Thread] = {}
+        self._chapter_locks: dict[tuple[str, int], threading.Lock] = {}
 
     # ---------------------------------------------------------------- scheduling
     def set_focus(self, book_id: str, chapter: int, unit: int) -> None:
@@ -57,7 +86,7 @@ class Worker(threading.Thread):
     def _order(self):
         """Books to render, in priority order: the one being listened to first, then the others by recent use.
         Books with rendering switched off are skipped entirely."""
-        books = [m for m in lib.list_books() if m.get("render", True)]
+        books = [m for m in lib.list_books() if m.get("render", True) and m.get("pipeline", 1) >= lib.PIPELINE]   # not mid-upgrade
         focus = self.focus
         if focus is None:
             p = next((m["position"] for m in books if m.get("position")), None)
@@ -72,12 +101,14 @@ class Worker(threading.Thread):
                 out.append((m, p.get("chapter", 0), p.get("unit", 0)))
         return out
 
-    def _first_missing(self, m: dict, ch0: int, u0: int):
+    def _first_missing(self, m: dict, ch0: int, u0: int, focus_chapter: int | None = None):
         order = [c for c in m["chapters"] if c["include"] and c["n_segments"]]
         order = [c for c in order if c["index"] >= ch0] + [c for c in order if c["index"] < ch0]   # ahead first, then wrap
         for c in order:
             if lib.chapter_status(m["id"], c["index"], c["n_segments"]).count(False) == 0:
                 continue
+            if c["index"] != focus_chapter and (m["id"], c["index"]) in self.claims:
+                continue                               # a side lane has it
             chap = lib.chapter(m["id"], c["index"])
             start_seg = 0
             if c["index"] == ch0:
@@ -90,15 +121,70 @@ class Worker(threading.Thread):
     def next_job(self):
         if lib.settings()["paused"]:
             return None
-        for m, ch0, u0 in self._order():
-            job = self._first_missing(m, ch0, u0)
+        for k, (m, ch0, u0) in enumerate(self._order()):
+            job = self._first_missing(m, ch0, u0, ch0 if k == 0 else None)
             if job:
                 return job
         return None
 
+    def _side_job(self, lane: int):
+        """A whole later chapter for a side lane: the listened book's next chapters first, then the other books'."""
+        if lib.settings()["paused"] or mem_available_gb() < SIDE_LANE_MIN_GB:
+            return None                                # not enough memory to spare: lane 0 alone
+        with self.claims_lock:
+            for k, (m, ch0, _u0) in enumerate(self._order()):
+                for c in m["chapters"]:
+                    if not (c["include"] and c["n_segments"]) or (k == 0 and c["index"] <= ch0) or (k > 0 and c["index"] < ch0):
+                        continue
+                    key = (m["id"], c["index"])
+                    if key in self.claims or key == self.lane0_at:
+                        continue
+                    if lib.chapter_status(m["id"], c["index"], c["n_segments"]).count(False) == 0:
+                        continue
+                    self.claims[key] = lane
+                    return m, lib.chapter(m["id"], c["index"])
+        return None
+
+    def _side_lane(self, lane: int) -> None:
+        log.info("lane %d started", lane)
+        while lane <= self.side_wanted:
+            job = None
+            try:
+                job = self._side_job(lane)
+                if job is None:
+                    self.lane_jobs.pop(lane, None)
+                    time.sleep(10)
+                    continue
+                m, chap = job
+                for s in range(len(chap["segments"])):
+                    if lane > self.side_wanted or self.lane0_at == (m["id"], chap["index"]) or lib.settings()["paused"] \
+                            or mem_available_gb() < SIDE_LANE_STOP_GB:
+                        break                              # fewer lanes, the listener came here, or memory is tight
+                    if not lib.segment_ready(m["id"], chap["index"], s):
+                        if self.render_segment(m, chap, s, lane=lane) is False:
+                            break
+            except Exception:  # noqa: BLE001
+                log.error("lane %d render failed: %s", lane, traceback.format_exc())
+                time.sleep(10)
+            finally:
+                if job:
+                    with self.claims_lock:
+                        self.claims.pop((job[0]["id"], job[1]["index"]), None)
+        self.lane_jobs.pop(lane, None)
+        log.info("lane %d stopped", lane)
+
+    def _ensure_lanes(self) -> None:
+        self.side_wanted = lanes_for(lib.settings()["threads"]) - 1
+        for lane in range(1, self.side_wanted + 1):
+            t = self._side.get(lane)
+            if t is None or not t.is_alive():
+                self._side[lane] = threading.Thread(target=self._side_lane, args=(lane,), daemon=True, name=f"render-lane-{lane}")
+                self._side[lane].start()
+        self.status["lanes"] = [dict(j) for j in self.lane_jobs.values()]
+
     def queue(self) -> list[dict]:
         """Every book with its rendering state, progress and an ETA at the current speed."""
-        rate = self.status.get("rate") or 1.0
+        rate = (self.status.get("rate") or 1.0) * max(1, 1 + len(self.lane_jobs))   # every lane's output
         out, ahead = [], 0.0
         order = [m for m, *_ in self._order()]
         rest = [m for m in lib.list_books() if m["id"] not in {o["id"] for o in order}]
@@ -132,22 +218,35 @@ class Worker(threading.Thread):
             pass
         import torch
         torch.set_num_threads(threads)
+        idle_since, released = 0.0, False
         while True:
             try:
                 self._apply_threads()
+                self._ensure_lanes()
                 job = self.next_job()
                 if job is None:
+                    self.lane0_at = None
                     self.status.update(state="paused" if lib.settings()["paused"] else "idle", job=None)
+                    idle_since = idle_since or time.time()
+                    if not released and not self.lane_jobs and time.time() - idle_since > IDLE_RELEASE_S:
+                        from .engine import release
+                        release()                    # ~4 GB back to the system while there's nothing to render
+                        released = True
+                        log.info("idle: models unloaded")
                     self.wake.wait(30)
                     self.wake.clear()
                     continue
+                idle_since, released = 0.0, False
+                self.lane0_at = (job[0]["id"], job[1]["index"])
                 self.render_segment(*job)
             except Exception as e:  # keep the worker alive; surface the error in /api/status
                 log.error("render failed: %s", traceback.format_exc())
                 self.status.update(state="error", error=str(e))
                 time.sleep(10)
 
-    def render_segment(self, m: dict, chap: dict, s: int) -> None:
+    def render_segment(self, m: dict, chap: dict, s: int, lane: int = 0):
+        """Render one piece. Lane 0 follows the listener (and reports to the app's countdown); side lanes render
+        later chapters. Returns False when a side lane should give the chapter up."""
         from .engine import Engine
         from .render import VoiceStats, assemble, render_unit
         seg = chap["segments"][s]
@@ -155,39 +254,140 @@ class Worker(threading.Thread):
         cache = lib.CACHE / eng.voice
         cache.mkdir(parents=True, exist_ok=True)
         stats = self._stats.setdefault(eng.key, VoiceStats())
-        self.status.update(state="rendering", error=None,
-                           job=dict(book=m["id"], title=m["title"], chapter=chap["index"], chapter_title=chap["title"],
-                                    segment=s, of=len(chap["segments"])))
+        job = dict(book=m["id"], title=m["title"], chapter=chap["index"], chapter_title=chap["title"],
+                   segment=s, of=len(chap["segments"]), units=seg["u1"] - seg["u0"], done=0, est=seg["est"], started=time.time())
+        if lane == 0:
+            self.status.update(state="rendering", error=None, job=job)
+        else:
+            self.lane_jobs[lane] = job
         units, metas, t0 = [], [], time.time()
         focus_at_start = self.focus
-        for i in range(seg["u0"], seg["u1"]):
-            u = _unit(chap, i)
-            metas.append(render_unit(u, eng, stats, cache))
-            units.append(u)
-            if lib.settings()["paused"] or not lib.meta(m["id"]).get("render", True):
-                return                               # paused from the UI: stop at the next sentence (takes stay cached)
-            if self.focus != focus_at_start:        # listener jumped elsewhere: serve that first
-                nxt = self.next_job()
-                if nxt and (nxt[0]["id"], nxt[1]["index"], nxt[2]) != (m["id"], chap["index"], s):
-                    return
+        # Pocket with context renders as a chain (each sentence hears the one before): the next sentence starts in a
+        # worker process as soon as this one's first take exists, overlapping verification. Otherwise every first
+        # take of the segment starts at once.
+        chain = getattr(eng, "uses_context", False)
+        firsts = {} if chain else self._prefetch(eng, chap, seg, cache)
+        ahead: dict = {}
+        prev_u = _unit(chap, seg["u0"] - 1) if chain and seg["u0"] > 0 else None
+        prev_audio = self._cached_final(chap, seg["u0"] - 1, eng, cache) if prev_u else None
+
+        def start(j: int, context):
+            if not chain or j >= seg["u1"] or j in ahead:
+                return
+            un = _unit(chap, j)
+            before = _unit(chap, j - 1) if j > 0 else None
+            if context is None or (cache / f"{unit_key(un, eng, ctx_id(before))}.json").exists():
+                return
+            f = self._submit(eng, un, context)
+            if f is not None:
+                ahead[j] = f
+        try:
+            for i in range(seg["u0"], seg["u1"]):
+                u = _unit(chap, i)
+                ctx = (ctx_id(prev_u), prev_audio) if chain and prev_u is not None and prev_audio is not None else None
+                first = firsts.get(i) or ahead.pop(i, None)
+                if chain and first is None and not (cache / f"{unit_key(u, eng, ctx[0] if ctx else '')}.json").exists():
+                    first = self._submit(eng, u, ctx[1] if ctx else None)
+                t_unit = time.time()
+                meta = render_unit(u, eng, stats, cache, first, ctx, on_first=(lambda a, j=i + 1: start(j, a)) if chain else None)
+                if lane == 0:
+                    self._note_speed(meta["duration"], time.time() - t_unit)
+                metas.append(meta)
+                units.append(u)
+                job["done"] = len(metas)                  # the app shows a real countdown while you wait
+                if chain:
+                    prev_u, prev_audio = u, final_audio(meta, cache)
+                    start(i + 1, prev_audio)                 # a cached sentence never produced a first take: start now
+                if lib.settings()["paused"] or not lib.meta(m["id"]).get("render", True):
+                    return False                         # paused from the UI: stop at the next sentence (takes stay cached)
+                if lane:
+                    if lane > self.side_wanted or self.lane0_at == (m["id"], chap["index"]):
+                        return False                     # fewer lanes now, or the listener came to this chapter
+                    continue
+                if self.focus != focus_at_start:        # listener jumped elsewhere: serve that first
+                    nxt = self.next_job()
+                    if nxt and (nxt[0]["id"], nxt[1]["index"], nxt[2]) != (m["id"], chap["index"], s):
+                        return
+        finally:
+            for f in list(firsts.values()) + list(ahead.values()):
+                f.cancel()
+        now = lib.meta(m["id"])
+        if (now.get("gen", 0), now.get("pipeline"), now["voice"]) != (m.get("gen", 0), m.get("pipeline"), m["voice"]):
+            return                                   # the book's audio was reset while we worked (voice, upgrade): discard
         out = lib.audio_dir(m["id"], chap["index"])
         out.mkdir(parents=True, exist_ok=True)
         wav = out / f"{s}.wav"                       # kept until the whole chapter is joined into one file
         tl = assemble(units, metas, cache, wav, lead_in=0.0)
-        _encode([wav], out / f"{s}.m4a")
+        with self._lock_for(m["id"], chap["index"]):
+            if lib.segment_ready(m["id"], chap["index"], s):
+                return                                   # another lane finished it first
+            _encode([wav], out / f"{s}.m4a")
         units_out = []
         for k, (u, ut) in enumerate(zip(units, tl["units"])):
             text = chap["blocks"][u.block]["text"]
             units_out.append(dict(i=seg["u0"] + k, t0=ut["t0"], t1=ut["t1"],
                                   words=timing.map_words(text, u.start, u.end, ut["words"], ut["t0"], ut["t1"])))
-        lib._write(out / f"{s}.json", dict(duration=tl["duration"], units=units_out))
-        self.build_chapter(m, chap)
+        with self._lock_for(m["id"], chap["index"]):
+            lib._write(out / f"{s}.json", dict(duration=tl["duration"], units=units_out))
+            self.build_chapter(m, chap)
         took = time.time() - t0
         self.status["rendered_secs"] += tl["duration"]
         # speed = audio rendered / wall time over the last 15 minutes (one slow segment no longer swings it)
         now = time.time()
         self._window = [(t, a, w) for t, a, w in getattr(self, "_window", []) if now - t < 900] + [(now, tl["duration"], took)]
         self.status["rate"] = round(sum(a for _, a, _ in self._window) / max(sum(w for *_, w in self._window), 1e-6), 2)
+
+    def _lock_for(self, book_id: str, ch: int) -> threading.Lock:
+        with self.claims_lock:
+            return self._chapter_locks.setdefault((book_id, ch), threading.Lock())
+
+    def _prefetch(self, eng, chap: dict, seg: dict, cache: Path) -> dict:
+        """Pocket: start take 0 of every sentence of this segment not yet cached, in parallel worker processes.
+        Their number follows the CPU setting: Low 1, Medium 3, High 5 (each uses one core)."""
+        from .engine import drop_pool, synth_pool
+        from .render import _seed, unit_key
+        if getattr(eng, "kind", "") != "pocket":
+            return {}
+        pool = synth_pool(lanes_for(lib.settings()["threads"]))
+        out = {}
+        try:
+            for i in range(seg["u0"], seg["u1"]):
+                u = _unit(chap, i)
+                if not (cache / f"{unit_key(u, eng)}.json").exists():
+                    out[i] = pool.submit(_synth_job, eng.lang, eng.voice, u.spoken, _seed(u.spoken, 0))
+        except Exception:  # noqa: BLE001  (a broken pool: render in-process this time)
+            drop_pool()
+        return out
+
+    def _note_speed(self, audio_s: float, wall_s: float) -> None:
+        """Speed on freshly voiced sentences only (cached ones take no time and would make waits look shorter
+        than they are): what the app's countdown uses while you wait for a part to render."""
+        if wall_s < 0.4:
+            return
+        self._fresh = (getattr(self, "_fresh", []) + [(audio_s, wall_s)])[-25:]
+        self.status["speed"] = round(sum(a for a, _ in self._fresh) / max(sum(w for _, w in self._fresh), 1e-6), 2)
+
+    def _submit(self, eng, u: Unit, context):
+        """Take 0 of one sentence in a worker process (None if the pool is broken: it's then rendered here)."""
+        from .engine import drop_pool, synth_pool
+        from .render import _seed
+        try:
+            return synth_pool(lanes_for(lib.settings()["threads"])).submit(_synth_job, eng.lang, eng.voice, u.spoken, _seed(u.spoken, 0), context)
+        except Exception:  # noqa: BLE001
+            drop_pool()
+            return None
+
+    def _cached_final(self, chap: dict, i: int, eng, cache: Path):
+        """The chosen take of sentence i, if it was rendered (with or without its own context)."""
+        if i < 0:
+            return None
+        u = _unit(chap, i)
+        before = _unit(chap, i - 1) if i > 0 else None
+        for key in (unit_key(u, eng, ctx_id(before)), unit_key(u, eng, "")):
+            meta = lib._read(cache / f"{key}.json")
+            if meta and (cache / f"{key}.wav").exists():
+                return final_audio(meta, cache)
+        return None
 
     def build_chapter(self, m: dict, chap: dict) -> None:
         """Once every segment exists, join them into one continuous chapter file (no hand-offs while listening)."""
@@ -206,6 +406,7 @@ class Worker(threading.Thread):
             offset += sf.info(str(w)).frames / sf.info(str(w)).samplerate
         _encode(wavs, out / "full.m4a")
         lib._write(out / "full.json", dict(duration=round(offset, 3), units=units))
-        for w in wavs:
-            w.unlink(missing_ok=True)
+        for f in out.iterdir():          # the pieces are now in the chapter file (a player still on them reloads it)
+            if not f.name.startswith("full."):
+                f.unlink(missing_ok=True)
         log.info("chapter file ready: %s ch%s (%.0f s)", m["id"], ch, offset)

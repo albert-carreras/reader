@@ -23,21 +23,20 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import library as lib
-from .engine import DEFAULT_VOICE
+from .engine import DEFAULT_VOICE, VOICES as engine_voices
 from .worker import Worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("pocket_tts").setLevel(logging.WARNING)      # five INFO lines per sentence otherwise
+import warnings  # noqa: E402
+warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*|.*parse an XML document.*")
+warnings.filterwarnings("ignore", message=".*forced_align has been deprecated.*")
 WEB = Path(__file__).parent / "web"
 ACCESS_TEAM = os.environ.get("READER_ACCESS_TEAM", "")       # e.g. bertini.cloudflareaccess.com
 ACCESS_AUD = os.environ.get("READER_ACCESS_AUD", "")         # Application Audience (AUD) tag; optional but recommended
 PUBLIC_HOSTS = {h for h in os.environ.get("READER_PUBLIC_HOSTS", "reader.bored.cat").split(",") if h}
 
-VOICES = {
-    "es": ["Alba", "Noa", "Candela", "Celia", "Alicia", "Nerea", "Lucía-Sol", "Marcos", "Borja", "Iker", "Nuno", "Izan",
-           "Guillermo", "Rebeca", "Regina", "Danae", "Azucena", "Jimena", "Ximena", "Lalo", "Aldo", "Yael", "Ulises", "Leonel", "Nico"],
-    "en": ["Easton", "Micah", "Trevor", "Russell", "Preston", "Miles", "Zoey", "Juniper", "Everly", "Harper", "Hadley", "Delia",
-           "Maeve", "Freya", "Pippa", "Elodie-Rose", "Imogen", "Lottie", "Bryony", "Alfie", "Hugh", "Edwin", "Spencer", "Toby", "Teddy"],
-}
+VOICES = engine_voices        # Pocket first (the default engine), then Phonon
 
 app = FastAPI(title="reader", docs_url=None, redoc_url=None, openapi_url=None)
 worker = Worker()
@@ -47,8 +46,11 @@ worker = Worker()
 def _start():
     lib.BOOKS.mkdir(parents=True, exist_ok=True)
     lib.CACHE.mkdir(parents=True, exist_ok=True)
-    lib.upgrade_all()
+    if os.environ.get("READER_NO_WORKER") == "1":      # a test instance on a copy of the data: serve only, never render
+        return
     worker.start()
+    # older books are re-segmented in the background: the app answers immediately, the renderer skips them meanwhile
+    threading.Thread(target=lib.upgrade_all, kwargs=dict(after_each=worker.wake.set), daemon=True, name="upgrade").start()
 
 
 # ---------------------------------------------------------------- auth
@@ -129,6 +131,7 @@ def _book_or_404(book_id: str) -> dict:
 
 @app.get("/api/status")
 def status():
+    worker.status["lanes"] = [dict(j) for j in worker.lane_jobs.values()]
     st = dict(worker=worker.status, focus=worker.focus, settings=lib.settings())
     job = worker.status.get("job")
     if job:
@@ -140,6 +143,7 @@ def status():
 
 @app.get("/api/system")
 def system():
+    worker.status["lanes"] = [dict(j) for j in worker.lane_jobs.values()]
     return dict(worker=worker.status, settings=lib.settings(), queue=worker.queue())
 
 
@@ -216,13 +220,16 @@ def get_book(book_id: str):
         c["ready"] = sum(st)
         c["full"] = lib.chapter_file_ready(book_id, c["index"])        # downloadable for offline
         c["bytes"] = (lib.audio_dir(book_id, c["index"]) / "full.m4a").stat().st_size if c["full"] else 0
+        c["v"] = lib.audio_version(lib.audio_dir(book_id, c["index"]) / "full.m4a") if c["full"] else None
     m["position"] = lib.position(book_id)
     m["progress"] = lib.progress(m)
     m["voices"] = VOICES.get(m["lang"], VOICES["en"])
     m["langs"] = lib.LANGS
     q = next((b for b in worker.queue() if b["id"] == book_id), None)
     m["eta"] = q and q["eta"]
-    m["rendering_now"] = (worker.status.get("job") or {}).get("book") == book_id
+    job = worker.status.get("job") or {}
+    m["rendering_now"] = job.get("book") == book_id
+    m["rendering_at"] = job.get("chapter") if m["rendering_now"] else None   # which chapter, so "2% ready" has a where
     return m
 
 
@@ -313,6 +320,33 @@ def get_chapter_audio(book_id: str, n: int):
     return FileResponse(p, media_type="audio/mp4", headers={"cache-control": "private, max-age=31536000, immutable"})
 
 
+def _stream_or_404(book_id: str, n: int, part: str):
+    _book_or_404(book_id)
+    if part != "full" and not part.isdigit():
+        raise HTTPException(404)
+    r = lib.stream(book_id, n, part)
+    if not r:
+        raise HTTPException(404, "not rendered yet")
+    return r
+
+
+@app.get("/api/books/{book_id}/stream/{n}/{part}.json")
+def get_stream_index(book_id: str, n: int, part: str):
+    """Fragment table + timeline of one rendered file, for the player's continuous MediaSource stream."""
+    return JSONResponse(_stream_or_404(book_id, n, part)[1])
+
+
+@app.get("/api/books/{book_id}/stream/{n}/{part}.mp4")
+def get_stream_audio(book_id: str, n: int, part: str, v: str | None = None):
+    # byte ranges are served by FileResponse. The client asks for the version its fragment table describes: if the
+    # audio was rebuilt since (new voice, pipeline upgrade), 410 tells it to reload instead of appending wrong bytes.
+    path, idx = _stream_or_404(book_id, n, part)
+    if v and v != idx["v"]:
+        raise HTTPException(410, "audio was rebuilt")
+    return FileResponse(path, media_type="audio/mp4",
+                        headers={"cache-control": "private, max-age=31536000, immutable"})
+
+
 @app.get("/api/books/{book_id}/audio/{n}/{s}.m4a")
 def get_audio(book_id: str, n: int, s: int):
     _book_or_404(book_id)
@@ -320,6 +354,32 @@ def get_audio(book_id: str, n: int, s: int):
     if not p.exists():
         raise HTTPException(404, "not rendered yet")
     return FileResponse(p, media_type="audio/mp4", headers={"cache-control": "private, max-age=31536000, immutable"})
+
+
+CLIENT_LOG = lib.DATA / "client.log"
+_log_lock = threading.Lock()
+LOG_KEYS = ("at", "kind", "detail", "book", "ch", "t", "paused", "vis", "online")
+
+
+@app.post("/api/log")
+async def client_log(request: Request):
+    """The phone's playback log (errors, recoveries, stalls, chapter changes), so problems can be read afterwards."""
+    try:
+        items = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "bad log")
+    if not isinstance(items, list):
+        raise HTTPException(400, "bad log")
+    ua = request.headers.get("user-agent", "")
+    dev = "iPhone" if "iPhone" in ua else "iPad" if "iPad" in ua else "Mac" if "Macintosh" in ua else "Android" if "Android" in ua else "other"
+    lines = [json.dumps(dict(srv=round(time.time(), 1), dev=dev, **{k: it.get(k) for k in LOG_KEYS}), ensure_ascii=False)
+             for it in items[:200] if isinstance(it, dict)]
+    with _log_lock:
+        if CLIENT_LOG.exists() and CLIENT_LOG.stat().st_size > 2_000_000:
+            os.replace(CLIENT_LOG, CLIENT_LOG.with_suffix(".log.1"))
+        with CLIENT_LOG.open("a") as f:
+            f.write("".join(line + "\n" for line in lines))
+    return {"ok": True}
 
 
 class FocusIn(BaseModel):
@@ -338,6 +398,9 @@ class PositionIn(BaseModel):
     chapter: int
     unit: int
     t: float = 0.0           # seconds into the chapter
+    block: int | None = None   # where that is in the text (survives re-segmentation) ...
+    start: int | None = None
+    du: float | None = None    # ... and how far into the sentence (survives a re-render)
     at: float | None = None  # client timestamp (ms) of this position, for offline catch-up
 
 
@@ -348,7 +411,7 @@ def put_position(book_id: str, body: PositionIn):
     cur = lib.position(book_id) or {}
     if body.at and cur.get("updated") and body.at / 1000 < cur["updated"] - 1:
         return cur      # an older offline write arriving late: keep the newer position
-    return lib.set_position(book_id, body.chapter, body.unit, body.t)
+    return lib.set_position(book_id, body.chapter, body.unit, body.t, body.block, body.start, body.du)
 
 
 def main():

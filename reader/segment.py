@@ -89,12 +89,23 @@ def _quote_phrases(text: str) -> list[tuple[int, int, str]]:
             k += 1  # apostrophe inside a word, keep looking
         if k < 0:
             break
-        if j > i:
-            spans.append((i, j, "narration"))
-        spans.append((j + 1, k, "speech"))
-        i = k + 1
+        if _speechlike(text[j + 1:k], any(r == "speech" for *_, r in spans)):
+            if j > i:
+                spans.append((i, j, "narration"))
+            spans.append((j + 1, k, "speech"))
+            i = k + 1
+        else:                       # a quoted word or title ("sack", "The Raven"): stays inside the sentence
+            spans.append((i, k + 1, "narration"))
+            i = k + 1
     if i < n:
         spans.append((i, n, "narration"))
+    merged = []                     # join the narration pieces that quoted mentions left behind
+    for a, b, r in spans:
+        if merged and r == "narration" and merged[-1][2] == "narration" and merged[-1][1] == a:
+            merged[-1] = (merged[-1][0], b, r)
+        else:
+            merged.append((a, b, r))
+    spans = merged
     has_speech = any(r == "speech" for *_, r in spans)
     def role(a, b, r):
         if r != "narration" or not has_speech:
@@ -102,6 +113,15 @@ def _quote_phrases(text: str) -> list[tuple[int, int, str]]:
         seg = text[a:b].strip()
         return "tag" if len(seg) < 100 or seg[:1].islower() else "narration"
     return [(a, b, role(a, b, r)) for a, b, r in spans] or [(0, n, "narration")]
+
+
+def _speechlike(q: str, after_speech: bool) -> bool:
+    """Is a quoted span someone talking? Dialogue starts with a capital (or continues an earlier quote) and ends in
+    punctuation, or runs to a few words. A single quoted word or a short title is a mention, not dialogue."""
+    q = q.strip()
+    words = len(re.findall(r"\w+", q))
+    starts = after_speech or q[:1].isupper() or q[:1] in "¿¡"
+    return (starts or words >= 4) and (bool(re.search(r"[.,;:!?…—-]$", q)) or words >= 4)
 
 
 def _phrases(text: str) -> list[tuple[int, int, str]]:
@@ -200,6 +220,25 @@ def _end_pause(kind: str, chars: int = 0) -> float:
     return _scaled(base, chars)
 
 
+def _join_dialogue(bu: list[Unit], text: str) -> list[Unit]:
+    """One sentence split by quotes or rayas is voiced as one unit: “I’m sorry,” he said, “it’s just that…” reads as
+    a single breath with the tag dropped in, instead of three fragments that each end like a sentence (Pocket turns a
+    trailing comma into a full stop). Joined: a piece that ends mid-sentence and whatever continues it, and a
+    lowercase tag after a question or exclamation (“Really?” she asked). An action beat in its own sentence
+    (“Biscuit looked thoughtful.”) stays separate."""
+    out: list[Unit] = []
+    for v in bu:
+        u = out[-1] if out else None
+        joins = u is not None and len(u.spoken) + len(v.spoken) < MAX_CHARS and (     # (giant sentences split on purpose stay split)
+            u.kind == "continuation" or (u.role == "speech" and v.role == "tag" and v.text.lstrip("—― ")[:1].islower()))
+        if not joins:
+            out.append(v)
+            continue
+        out[-1] = Unit("", u.block, u.start, v.end, text[u.start:v.end], f"{u.spoken} {v.spoken}",
+                       "speech" if "speech" in (u.role, v.role) else u.role, v.kind, v.pause)
+    return out
+
+
 # ---------------------------------------------------------------- chapter -> units
 
 def units(ch: Chapter, lang: str) -> list[Unit]:
@@ -271,6 +310,7 @@ def units(ch: Chapter, lang: str) -> list[Unit]:
                     u.kind, u.pause = "continuation", P["inner_tag"]
                 else:
                     u.spoken += "."
+        bu = _join_dialogue(bu, text)
         if bu:
             nxt = next((b for b in ch.blocks[bi + 1:] if b.kind != "scene_break"), None)
             turn = nxt is not None and (nxt.text.lstrip()[:1] in RAYA + "“«\"‘")

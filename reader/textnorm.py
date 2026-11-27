@@ -12,6 +12,8 @@ SECTION_WORDS = {
     "en": r"chapter|chap\.|book|part|volume|vol\.|act|scene|canto|stave|section|lesson|article|letter",
 }
 CHAPTER_WORD = {"es": "Capítulo", "en": "Chapter"}
+YEAR_RANGE = re.compile(r"(?<![\d-])\b(1\d{3}|20\d{2})\s*[-–]\s*(\d{4}|\d{2})\b(?![-\d])")
+PAGE_RANGE = re.compile(r"\b((?i:pages|page|pp\.|p\.|páginas|página|págs\.|pág\.|chapters|capítulos|verses|versículos|versos)\s+)(\d{1,4})\s*[-–]\s*(\d{1,4})\b")
 CONJ = {"es": "a", "en": "to"}
 
 
@@ -74,11 +76,19 @@ def pre_rules(s: str, lang: str) -> str:
     if lang == "es":
         # 19th-century orthography: the preposition/conjunctions written with an accent
         s = re.sub(r"(?<![\wÁÉÍÓÚáéíóú])([áéóúÁÉÓÚ])(?![\wÁÉÍÓÚáéíóú])", lambda m: {"á": "a", "é": "e", "ó": "o", "ú": "u", "Á": "A", "É": "E", "Ó": "O", "Ú": "U"}[m.group(1)], s)
-    # year ranges: 1914-1918 -> 1914 a 1918
-    s = re.sub(r"\b(\d{3,4})\s*[-–]\s*(\d{2,4})\b", lambda m: f"{m.group(1)} {CONJ[lang]} {m.group(2)}", s)
-    # Roman numerals after section words read as cardinals: "capítulo IV" -> "capítulo 4"
-    s = re.sub(r"\b(%s)\s+([IVXLCDM]+)\b" % SECTION_WORDS[lang],
-               lambda m: f"{m.group(1)} {roman_to_int(m.group(2)) or m.group(2)}", s, flags=re.I)
+    # ranges: years (1914-1918, 1990-91) and pages/chapters (pp. 111-222) read "a"/"to"; phone numbers don't
+    s = YEAR_RANGE.sub(lambda m: m.group(0) if len(m.group(2)) == 4 and int(m.group(2)) <= int(m.group(1))
+                       else f"{m.group(1)} {CONJ[lang]} {m.group(2)}", s)
+    s = PAGE_RANGE.sub(lambda m: f"{m.group(1)}{m.group(2)} {CONJ[lang]} {m.group(3)}", s)
+    # Roman numerals after section words read as cardinals: "capítulo IV" -> "capítulo 4". Numerals must be capitals
+    # (not "book mix"), and in English a lone "I" is the pronoun ("the book I wanted") unless the section word is
+    # capitalised ("Part I of") or punctuation follows ("in volume I.")
+    def section(m):
+        word, num = m.group(1), m.group(2)
+        if lang == "en" and num == "I" and not word[:1].isupper() and not re.match(r"\s*([.,:;!?)\]—–-]|$)", s[m.end():]):
+            return m.group(0)
+        return f"{word} {roman_to_int(num) or num}"
+    s = re.sub(r"\b((?i:%s))\s+([IVXLCDM]+)\b" % SECTION_WORDS[lang], section, s)
     if lang == "en":
         s = re.sub(r"\b([IVXLCDM]{2,})(?=\s+century)", lambda m: f"{roman_to_int(m.group(1))}th" if roman_to_int(m.group(1)) else m.group(1), s)
     return _caps_fix(s)

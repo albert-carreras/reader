@@ -19,7 +19,23 @@
 - one-tap continue
 - installable web app (manifest, icons, service worker)
 
-**Next:** confirm background audio on the iPhone with the screen locked, including across chapter changes.
+**Done after the v1 audit (2026-11-26, night):**
+- continuous playback: one MediaSource stream per book, so the audio never ends between chapters (iOS stops a locked web app's audio at a natural end and won't restart it); fragmented copies of each rendered file are made on first use
+- playback keeps going on every screen, with a now-playing bar
+- long sentences (Melchor) highlight and step by clause
+- pipeline upgrades run in the background, keep your place by its position in the text, and never mix old and new audio (stale streams answer 410; downloads carry a version)
+- narration: English "the book I wanted" no longer reads "one"; phone numbers aren't year ranges; quoted words ("sack") stay inside the sentence; mid-sentence dead air is shortened; a take that fails verification gets 3 more seeds
+- `reader qa [book]`: the rendered sentences most worth a listen, with timestamps
+- reader polish: left-aligned text on phones, no highlight chip on headings, title-cased chapter names, clear time-left label
+
+**Engine change (2026-11-27):** blind intonation reels on both books picked **Pocket TTS** (Kyutai, 100M) over every Phonon voice. Phonon's catalog voices are all assistant and ad reads; Pocket ships LibriVox-narrator prompts. Now `caro_davy` (en) and `lola` (es). Phonon is still selectable. Pocket speaks on one core, so first takes run in parallel worker processes: ~2x realtime at Medium.
+
+**Next:**
+- **Done (round 2):** previous-sentence context. Each sentence's voice prompt is the reference clip plus the end of the sentence before, picked blind in both languages over plain takes and over cloned LibriVox narrators. Rendering becomes a chain, ~1.0–1.15x realtime at Medium.
+- faster context rendering: run separate chains on different chapters in parallel (a chapter start needs no context)
+- confirm on the iPhone with the screen locked: chapter changes, cold-start Continue, AirPods, a navigation-prompt interruption, offline after force-quit
+- set a long Cloudflare Access session (a lapsed session mid-commute looks like "Can't reach the server")
+- blind A/Bs: dialogue and its "he said" voiced as one sentence; a slower English pace
 
 Impact/effort: **H/M/L**. Measurements are from our own output (Temporada de huracanes, ch. II, 2026-11-26).
 

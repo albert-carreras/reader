@@ -4,6 +4,7 @@
   reader script BOOK.epub -c 3                    show what will be spoken (no audio)
   reader render BOOK.epub -c 3 [-n 40] [-v Noa]   render chapter 3 (optionally only its first n units)
   reader say "text" -l es                         render one line (debug)
+  reader qa [BOOK]                                the rendered sentences most worth a listen, with timestamps
 """
 from __future__ import annotations
 
@@ -67,8 +68,12 @@ def cmd_render(a):
     stats = VoiceStats()
     metas, t0, audio_s = [], time.time(), 0.0
     print(f"{bk.title} · {ch.title} · {len(units)} units · voice {eng.voice} · {a.threads} threads")
+    from .render import ctx_id, final_audio
+    prev, prev_audio = None, None
     for i, u in enumerate(units, 1):
-        m = render_unit(u, eng, stats, cache)
+        ctx = (ctx_id(prev), prev_audio) if eng.uses_context and prev is not None else None
+        m = render_unit(u, eng, stats, cache, ctx=ctx)
+        prev, prev_audio = u, final_audio(m, cache)
         metas.append(m)
         audio_s += m["duration"] + u.pause
         el = time.time() - t0
@@ -104,6 +109,52 @@ def cmd_say(a):
     print(spoken, prosody.features(audio))
 
 
+def cmd_qa(a):
+    """Rank rendered sentences by how likely they sound wrong, with chapter timestamps to listen at in the app."""
+    import hashlib
+    from . import library as lib
+    from .engine import Engine
+    books = [m for m in lib.list_books() if not a.book or a.book.lower() in (m["id"] + " " + m["title"]).lower()]
+    for m in books:
+        ek, cache = Engine.key_for(m["lang"], m["voice"]), lib.CACHE / m["voice"]
+        found, checked = [], 0
+        for c in m["chapters"]:
+            if not c["n_units"]:
+                continue
+            chap = lib.chapter(m["id"], c["index"])
+            d = lib.audio_dir(m["id"], c["index"])
+            parts = [lib._read(d / "full.json")] if (d / "full.json").exists() else [lib._read(d / f"{k}.json") for k in range(len(chap["segments"]))]
+            offset = 0.0
+            for part in parts:
+                if not part:
+                    break                       # not rendered from here on (timestamps would be guesses)
+                for ut in part["units"]:
+                    u = chap["units"][ut["i"]]
+                    meta = lib._read(cache / (hashlib.sha1(f"{ek}|{u['kind']}|{u['spoken']}".encode()).hexdigest()[:16] + ".json"))
+                    if not meta:
+                        continue
+                    checked += 1
+                    issues, f = [], meta.get("features") or {}
+                    if "UNVERIFIED" in meta["flags"]:
+                        issues.append((5, "unverified: " + next((x.split(": ", 1)[1] for x in meta["flags"] if x.startswith("take")), "")))
+                    unclear = [w["word"] for w in meta["words"] if len(w["word"]) >= 3 and w["score"] < 0.3]
+                    if unclear and "UNVERIFIED" not in meta["flags"]:
+                        issues.append((3, "unclear: " + " ".join(unclear[:4])))
+                    shift = (meta.get("reshaped") or {}).get("mild", 0) or 0
+                    d_end = f.get("final_delta", 0) + shift
+                    if u["kind"] == "yesno" and d_end < 1.0:
+                        issues.append((2, f"question may not rise ({d_end:+.1f} st)"))
+                    if u["kind"] == "statement" and d_end > 1.5:
+                        issues.append((2, f"statement may rise ({d_end:+.1f} st)"))
+                    if issues:
+                        found.append((max(i[0] for i in issues), c["title"], offset + ut["t0"], "; ".join(i[1] for i in issues), u["spoken"]))
+                offset += part["duration"]
+        found.sort(key=lambda x: (-x[0], x[1], x[2]))
+        print(f"\n{m['title']} ({m['voice']}): {len(found)} of {checked} rendered sentences worth a listen")
+        for sev, title, t, why, text in found[: a.limit]:
+            print(f"  {title[:24]:24s} {int(t // 60):3d}:{int(t % 60):02d}  {why}\n      {text[:110]}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="reader", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -117,6 +168,7 @@ def main(argv=None):
     s = sub.add_parser("say"); s.add_argument("text"); s.add_argument("-l", "--lang", default="es"); s.add_argument("-v", "--voice")
     s.add_argument("-s", "--seed", type=int, default=0); s.add_argument("-T", "--temperature", type=float, default=0.3)
     s.add_argument("-o", "--out", default="say.wav"); s.set_defaults(fn=cmd_say)
+    s = sub.add_parser("qa"); s.add_argument("book", nargs="?"); s.add_argument("-n", "--limit", type=int, default=25); s.set_defaults(fn=cmd_qa)
     a = p.parse_args(argv)
     a.fn(a)
 

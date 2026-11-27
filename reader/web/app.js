@@ -365,12 +365,10 @@ async function viewLibrary() {
   const top = topbar(brand(), null, renderChip(), gear(), h("button", { class: "iconbtn add", title: "Add book", onclick: picker, html: ICON.plus }));
   const main = h("main", { class: "wrap" });
   const recent = books.find((b) => positions.best(b.id, b.position));
-  if (recent) {
+  if (recent) {                 // the bottom bar offers it (and plays it in place) until something is playing
     const pos = positions.best(recent.id, recent.position);
     const ch = recent.chapters.find((c) => c.index === pos.chapter);
-    main.append(h("a", { class: "continue", href: `#/read/${recent.id}/${pos.chapter}?play` }, coverEl(recent),
-      h("div", { class: "grow" }, h("div", { class: "eyebrow" }, "Continue"), h("div", { class: "t" }, recent.title), h("div", { class: "muted" }, ch ? chapterLabel(ch.title, recent.lang) : "")),
-      h("span", { class: "chev", html: ICON2.chev })));
+    player.remember(recent, pos.chapter, ch?.title);
   }
   if (!navigator.onLine) main.append(h("div", { class: "offline-note" }, "You're offline · books on this phone still play"));
   main.append(h("div", { class: "lib-head" }, h("h1", {}, "Library"), books.length ? h("span", { class: "muted" }, `${books.length} book${books.length > 1 ? "s" : ""}`) : null));
@@ -485,7 +483,8 @@ async function viewSystem() {
   const main = h("main", { class: "wrap narrow" });
   app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
   const statusBox = h("section", { class: "card-box" }), queueBox = h("section", { class: "card-box rows" }), storeBox = h("section", { class: "card-box rows" });
-  main.append(statusBox, h("h2", { class: "section" }, "Books"), queueBox, h("h2", { class: "section" }, "Storage"), storeBox);
+  const machineBox = h("section", { class: "card-box rows" });
+  main.append(statusBox, h("h2", { class: "section" }, "Laptop"), machineBox, h("h2", { class: "section" }, "Books"), queueBox, h("h2", { class: "section" }, "Storage"), storeBox);
 
   const paint = async () => {
     if (!main.isConnected) return clearInterval(sysTimer);
@@ -508,6 +507,7 @@ async function viewSystem() {
         h("div", {}, h("b", {}, cur && cur.eta != null ? short(cur.eta) : "—"), h("span", {}, "left"))),
       h("div", { class: "row-between stack top-gap" }, h("div", {}, h("div", { class: "label" }, "CPU for rendering"), h("div", { class: "muted small" }, "More is faster, but the laptop gets busier and warmer")),
         seg([[2, "Low"], [4, "Medium"], [8, "High"]], s.settings.threads, async (v) => { await api("/api/system", { method: "PUT", body: JSON.stringify({ threads: v }) }); paint(); })));
+    if (s.machine) fill(machineBox, ...machineRows(s.machine, w.state === "rendering" && !paused));
     fill(queueBox, ...(s.queue.length ? s.queue.map((q) => h("div", { class: "row-between" },
       h("a", { class: "grow", href: `#/book/${q.id}` }, h("div", { class: "label" }, q.title),
         h("div", { class: "muted small" }, q.ready >= q.total - 1 ? `Fully rendered · ${human(q.total)}` : `${human(q.ready)} of ${human(q.total)} ready` + (q.render && q.eta != null ? ` · ${eta(q.eta)} to go` : q.render ? "" : " · off")),
@@ -534,6 +534,43 @@ async function viewSystem() {
   sysTimer = setInterval(paint, 4000);
   await paint();
   paintStorage();
+}
+
+// what the laptop is doing: the reader's share of CPU and memory next to everything else's, swap, heat, power
+function machineRows(m, rendering) {
+  const gb = (b) => b == null ? "—" : `${(b / 2 ** 30).toFixed(1)} GB`;     // GiB, like the limit in the service file
+  const meter = (parts, total, cap) => {    // parts: [[value, class]], drawn left to right; the rest is free
+    const el = h("div", { class: "meter" });
+    for (const [v, cls] of parts) if (v > 0) el.append(h("i", { class: cls, style: `width:${Math.min(100, 100 * v / total).toFixed(1)}%` }));
+    el.append(h("i", { class: "rest" }));
+    if (cap) el.append(h("b", { class: "cap", style: `left:${Math.min(100, 100 * cap / total).toFixed(1)}%`, title: "The reader's memory limit" }));
+    return el;
+  };
+  const key = (cls, text) => h("span", { class: "key" }, h("i", { class: `sw ${cls}` }), text);
+  const block = (label, value, bar, ...notes) => h("div", { class: "mrow" },
+    h("div", { class: "row-between" }, h("div", { class: "label" }, label), h("div", { class: "num" }, value)), bar,
+    ...notes.filter(Boolean).map((n) => h("div", { class: "muted small" }, n)));
+  const rows = [];
+  if (m.cpu != null) {
+    const mine = m.cpu_reader ?? 0, other = Math.max(0, m.cpu - mine);
+    const hot = m.temp != null && m.temp >= 85;
+    rows.push(block("CPU", `${Math.round(m.cpu)}%`, meter([[mine, "me"], [other, "other"]], 100),
+      h("span", {}, key("me", `Reader ${Math.round(mine)}%`), key("other", `Everything else ${Math.round(other)}%`)),
+      [`${m.cores} cores`, m.temp != null ? `${Math.round(m.temp)} °C${hot ? " · hot: Low rendering would cool it down" : ""}` : null].filter(Boolean).join(" · ")));
+  }
+  if (m.mem_total) {
+    const used = m.mem_total - m.mem_available, mine = Math.min(m.mem_reader || 0, used), other = Math.max(0, used - mine);
+    const cap = m.mem_reader_max || m.mem_reader_high;
+    rows.push(block("Memory", `${gb(used)} of ${gb(m.mem_total)}`, meter([[mine, "me"], [other, "other"]], m.mem_total, cap),
+      h("span", {}, key("me", `Reader ${gb(mine)}${cap ? ` (limit ${gb(cap)})` : ""}`), key("other", `Everything else ${gb(other)}`)),
+      `${gb(m.mem_available)} free${m.swap_used > 2e8 ? ` · ${gb(m.swap_used)} of ${gb(m.swap_total)} swapped to disk` : ""}`));
+  }
+  if (m.power) {
+    const p = m.power;
+    rows.push(h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Power"),
+      h("div", { class: "muted small" }, p.plugged ? `Plugged in · battery ${p.battery}%` : `On battery · ${p.battery}%${rendering ? " · rendering drains it faster" : ""}`))));
+  }
+  return rows;
 }
 
 // ------------------------------------------------------------------ settings
@@ -610,9 +647,13 @@ const player = {
     this.root = null;
   },
 
-  async open(bookId, chIndex, unit, autoplay) {
+  async open(bookId, chIndex, unit, autoplay, view = true) {
+    this.opening = true;          // until the jump below is under way, the audio may still be in another chapter
+    try { await this.openIn(bookId, chIndex, unit, autoplay, view); } finally { this.opening = false; }
+  },
+  async openIn(bookId, chIndex, unit, autoplay, view) {
     this.hide();
-    document.body.classList.add("has-player");
+    if (view) document.body.classList.add("has-player");
     this.follow = prefs.follow;
     const same = !!this.tape && this.book?.id === bookId;      // this book's stream is already going: keep it
     if (!same) {                                      // another book: stop this one and its pending retries
@@ -627,7 +668,8 @@ const player = {
     if (!same) this.newTape();
     const e = await this.entry(chIndex, !here);     // the chapter in the stream keeps its files (anchors point at them)
     this.ch = e.c; this.cur = -1; this.curWord = null;
-    this.render();
+    this.remember(b, chIndex, e.c.title);
+    if (view) this.render(); else { this.unitEls = []; this.paintMini(); }
     this.layout();
     this.speed(store.get(`speed:${bookId}`, 1));
     if (!this.tape) { this.setState("error", "This browser can't play audio streams"); return; }
@@ -977,6 +1019,7 @@ const player = {
     if (!e) return;
     this.ch = e.c; this.cur = -1; this.curWord = null; this.clauses = new Map();
     clog("chapter", `entered ${n}`);
+    this.remember(this.book, n, e.c.title);
     if (this.root) {
       this.render();
       this.layout();
@@ -1082,16 +1125,14 @@ const player = {
     this.$.remain = h("span");
     this.$.play = h("button", { class: "play", title: "Play (space)", html: ICON.play, onclick: () => this.toggle() });
     const ctrl = (icon, title, fn, cls = "") => h("button", { class: "iconbtn " + cls, title, "aria-label": title, html: icon, onclick: fn });
-    this.$.speed = h("button", { class: "speedbtn", title: "Playback speed", onclick: (e) => this.sheet("speed", e) });
+    this.$.speed = h("button", { class: "speedbtn", title: "Playback speed", onclick: (e) => this.sheet("speed", e) }, `${audio.playbackRate || 1}×`);
     this.$.status = h("div", { class: "float-status" });
     const bar = h("div", { class: "player" },
       scrub, h("div", { class: "times" }, this.$.elapsed, this.$.remain),
       h("div", { class: "ctrls" },
         this.$.speed,
         ctrl(skipIcon(-1), `Back ${prefs.skip} s`, () => this.skip(-1)),
-        ctrl(ICON.prev, "Previous sentence", () => this.step(-1), "sm"),
         this.$.play,
-        ctrl(ICON.next, "Next sentence", () => this.step(1), "sm"),
         ctrl(skipIcon(1), `Forward ${prefs.skip} s`, () => this.skip(1)),
         ctrl(ICON.list, "Chapters", (e) => this.sheet("chapters", e))));
     this.$.follow = h("button", { class: "follow", hidden: true, onclick: () => { this.follow = true; this.$.follow.hidden = true; this.scrollToCur(true); } }, "Back to narrator");
@@ -1154,7 +1195,7 @@ const player = {
     let pos = meta.start, target = span, since = 0;
     const put = (s) => s.split("\n").forEach((part, k) => { if (k) target.append(h("br")); if (part) target.append(part); });
     // a long sentence is split into clauses (at , ; : dashes and brackets, at least 4 words each): the highlight and
-    // the ‹ › buttons then move by clause instead of by a whole screen of text
+    // sentence steps (AirPods, arrow keys) then move by clause instead of by a whole screen of text
     const long = meta.end - meta.start > 260 && u.words.length > 30;
     const starts = [], els = [];
     const clause = (k) => { target = h("span", { class: "c" }); span.append(target); starts.push(k); els.push(target); since = 0; };
@@ -1227,7 +1268,7 @@ const player = {
       if (play) {
         this.showWaiting(f, "this part");
         this.waiting = setTimeout(() => this.tape && this.state === "waiting" && this.seek(unitHint != null ? this.timeOfUnit(unitHint) : T, true, unitHint), 3000);
-      } else this.setState("idle");
+      } else { this.setState("idle"); this.note("Not rendered yet · it's next in line, press play to wait for it", 6000); }
       return;
     }
     if (play) this.play();
@@ -1359,17 +1400,28 @@ const player = {
   // the now-playing bar on the other screens: what's playing, play/pause, tap to go back to the text
   mini() {
     this.$mini = null;
-    if (!this.tape || !this.book || !this.ch || this.root) return null;
-    const b = this.book;
-    const busy = this.state === "loading" || this.state === "waiting";
-    const play = h("button", { class: "mini-play" + (busy ? " busy" : ""), "aria-label": "Play or pause", html: this.state === "playing" ? ICON.pause : busy ? ICON.spin : ICON.play,
-      onclick: (e) => { e.preventDefault(); e.stopPropagation(); this.toggle(); } });
-    const sub = h("div", { class: "s" }, this.stateMsg && this.state !== "playing" ? this.stateMsg : chapterLabel(this.ch.title, b.lang));
-    const el = h("a", { class: "mini", href: `#/read/${b.id}/${this.ch.index}` }, coverEl(b), h("div", { class: "grow" }, h("div", { class: "t" }, b.title), sub), play);
+    if (this.root) return null;
+    const live = !!(this.tape && this.book && this.ch);
+    const r = live ? null : store.get("recent", null);
+    if (!live && !r) return null;
+    const b = live ? this.book : { id: r.id, title: r.title, lang: r.lang };
+    const n = live ? this.ch.index : r.ch;
+    const busy = live && (this.state === "loading" || this.state === "waiting");
+    const play = h("button", { class: "mini-play" + (busy ? " busy" : ""), "aria-label": "Play or pause", html: live && this.state === "playing" ? ICON.pause : busy ? ICON.spin : ICON.play,
+      onclick: (e) => { e.preventDefault(); e.stopPropagation(); this.tape && this.book?.id === b.id ? this.toggle() : this.startHere(b.id, n); } });
+    const sub = h("div", { class: "s" }, live && this.stateMsg && this.state !== "playing" ? this.stateMsg : chapterLabel(live ? this.ch.title : r.chTitle, b.lang));
+    const el = h("a", { class: "mini", href: `#/read/${b.id}/${n}` }, coverEl(b), h("div", { class: "grow" }, h("div", { class: "t" }, b.title), sub), play);
     this.$mini = { el, play, sub };
     document.body.classList.add("has-mini");
     return el;
   },
+  // play from the bottom bar without opening the book (cold start: nothing loaded yet)
+  async startHere(id, n) {
+    this.setState("loading");
+    try { await this.open(id, n, undefined, true, false); }
+    catch (e) { this.setState("error", navigator.onLine ? "Can't reach the laptop" : "You're offline"); }
+  },
+  remember(b, n, chTitle) { store.set("recent", { id: b.id, title: b.title, lang: b.lang, ch: n, chTitle: chTitle || "" }); },
   paintMini() {
     if (!this.$mini?.el.isConnected) return;
     this.$mini.el.setAttribute("href", `#/read/${this.book.id}/${this.ch.index}`);
@@ -1428,7 +1480,10 @@ const player = {
   update() {
     if (!this.tape || !this.ch) return;
     const m = this.map(audio.currentTime);
-    if (m && m.n !== this.ch.index) return this.enterChapter(m.n);
+    if (m && m.n !== this.ch.index) {
+      if (!audio.paused && !this.target && !this.opening) this.enterChapter(m.n);
+      return;
+    }
     if (!this.root) return;
     if (m && this.dragT == null) {
       const t = m.t, u = this.unitAtTime(t);
@@ -1529,13 +1584,14 @@ audio.addEventListener("playing", () => { clearTimeout(player.stallTimer); clear
 audio.addEventListener("seeked", () => player.positionState());
 audio.addEventListener("pause", () => {
   player.wake(false);
-  if (!player.holding && player.state !== "error") player.setState("idle");      // holding: we paused to wait, the state says why
+  // we paused to wait (holding, or already "waiting": the event arrives after the flag is gone): the state says why
+  if (!player.holding && player.state !== "error" && player.state !== "waiting") player.setState("idle");
   player.positionState();
   if (!player.tape || audio.ended) return;
   player.stoppedAt = Date.now();     // user pause *or* a system interruption (call, Siri, navigation)
   player.save();
 });
-audio.addEventListener("ratechange", () => player.positionState());
+audio.addEventListener("ratechange", () => { player.positionState(); if (player.$?.speed) player.$.speed.textContent = `${audio.playbackRate}×`; });
 // stopped by the system and resumed by the system (no tap): still go back a bit
 audio.addEventListener("play", () => {
   if (!player.tape || !player.stoppedAt || Date.now() - (player.ownPlayAt || 0) < 2000) return;

@@ -5,17 +5,12 @@ background on an ordinary laptop (CPU only). Listen on the phone as an installed
 along: the sentence highlighted, the word underlined. English and Spanish.
 
 <p>
-  <img src="docs/screenshots/library.jpg" width="260" alt="Library">
-  <img src="docs/screenshots/reader-light.png" width="260" alt="Reading along: sentence highlighted, word underlined">
-  <img src="docs/screenshots/reader-dark.png" width="260" alt="The reader in dark mode">
-</p>
-<p>
-  <img src="docs/screenshots/book.png" width="260" alt="A book: rendering progress, offline downloads, chapters">
-  <img src="docs/screenshots/waiting.png" width="260" alt="Caught up with the renderer: a countdown, then it plays by itself">
-  <img src="docs/screenshots/now-playing.jpg" width="260" alt="Playback continues on every screen, with a now-playing bar">
+  <img src="docs/screenshots/phone-library.jpg" width="260" alt="Library, with the now-playing bar">
+  <img src="docs/screenshots/phone-reader.jpg" width="260" alt="Reading along: sentence highlighted, word underlined">
+  <img src="docs/screenshots/phone-rendering.jpg" width="260" alt="Rendering: progress, speed, CPU setting, per-book switches">
 </p>
 
-*Screenshots use public-domain books (Carroll, Dickens, Pérez Galdós).*
+*On an iPhone, installed from the home screen, in dark mode.*
 
 ## What it does
 
@@ -43,7 +38,8 @@ along: the sentence highlighted, the word underlined. English and Spanish.
   That's what keeps playback going on a locked iPhone.
 - **Lock screen and AirPods:** play/pause, ±15 s skips, sentence steps.
   - After any stop (a pause, a call, a navigation prompt) it rewinds a little to a pause between words.
-- **Playback continues on every screen,** with a now-playing bar.
+- **A now-playing bar on every screen.** Before anything plays it offers the book you were last listening to, and
+  its play button starts it right there.
 - **The play button always answers.** A spinner while it loads; a countdown while a part is still rendering
   ("about 25 s, 2 of 6 sentences"), after which it plays by itself; and a plain reason when it can't play (offline and
   not downloaded, rendering paused, server unreachable).
@@ -54,7 +50,10 @@ along: the sentence highlighted, the word underlined. English and Spanish.
 - **Renders from where you are listening.** The next pieces come first, so you rarely wait. Pieces are 30 s, so a part
   that isn't rendered yet starts within about half a minute.
 - **Several chapters at once** (the CPU setting picks how many), each its own chain of context.
-- **Runs at low priority and gives its memory back** (~4 GB → ~0.4 GB) after 5 idle minutes.
+- **Runs at low priority and gives its memory back** (~5 GB → ~0.3 GB) after 5 idle minutes. The service has a
+  memory limit (`MemoryMax=7G`), and extra lanes only start when the laptop has memory to spare.
+- **The rendering page shows the laptop:** CPU and memory (the reader's share next to everything else's, and its
+  limit), temperature, battery.
 - **Survives restarts and upgrades.** Your place is kept by its position in the text; finished chapters keep their
   audio; a player streaming audio that was rebuilt reloads it in place.
 

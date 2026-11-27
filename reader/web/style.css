@@ -135,12 +135,7 @@ h2.section { font-size: .74rem; text-transform: uppercase; letter-spacing: .09em
 .stats span { font-size: .72rem; color: var(--muted); }
 
 /* ---------------------------------------------------------------- library */
-.continue { display: flex; align-items: center; gap: .9rem; margin: 1.1rem 0 .4rem; padding: .75rem .9rem .75rem .75rem; border-radius: var(--radius);
   background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
-.continue .cover { width: 54px; flex: none; border-radius: 5px; }
-.continue .eyebrow { font-size: .7rem; text-transform: uppercase; letter-spacing: .1em; color: var(--accent); font-weight: 750; }
-.continue .t { font: 650 1.08rem/1.25 var(--read-font); margin: .1rem 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.continue .muted { font-size: .88rem; }
 .lib-head { display: flex; align-items: baseline; justify-content: space-between; margin: 1.6rem .1rem 1rem; }
 .lib-head h1 { margin: 0; font: 650 1.75rem/1.1 var(--read-font); letter-spacing: -.01em; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 1.4rem 1rem; padding-bottom: 4rem; }
@@ -296,3 +291,14 @@ svg.spin { animation: spin .9s linear infinite; }
 .float-status .waiting { max-width: 34rem; white-space: normal; text-align: center; }
 .float-status .waiting.again { animation: pill-again .35s ease-out; }   /* the same message again: it still answers */
 @keyframes pill-again { 0% { transform: scale(.94); } 60% { transform: scale(1.03); } 100% { transform: none; } }
+
+/* rendering page: the laptop's CPU and memory, the reader's share first */
+.mrow .num { font-variant-numeric: tabular-nums; font-weight: 650; }
+.meter { position: relative; display: flex; gap: 2px; height: 6px; margin: .5rem 0 .45rem; }
+.meter > i { flex: none; height: 100%; border-radius: 3px; }
+.meter > i.me, .sw.me { background: var(--accent); }
+.meter > i.other, .sw.other { background: color-mix(in srgb, var(--muted) 60%, transparent); }
+.meter > i.rest { flex: 1; min-width: 0; background: var(--line); }
+.meter > b.cap { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink); opacity: .6; }
+.key { display: inline-flex; align-items: center; gap: .35rem; margin-right: .9rem; white-space: nowrap; }
+.sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }

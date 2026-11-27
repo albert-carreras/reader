@@ -107,8 +107,8 @@ class Worker(threading.Thread):
         for c in order:
             if lib.chapter_status(m["id"], c["index"], c["n_segments"]).count(False) == 0:
                 continue
-            if c["index"] != focus_chapter and (m["id"], c["index"]) in self.claims:
-                continue                               # a side lane has it
+            # (a side lane may hold this chapter: lane 0 takes it anyway, and the side lane steps aside after its
+            # current sentence; that keeps the chapter you'll hear next on the lane that follows you)
             chap = lib.chapter(m["id"], c["index"])
             start_seg = 0
             if c["index"] == ch0:
@@ -127,9 +127,11 @@ class Worker(threading.Thread):
                 return job
         return None
 
-    def _side_job(self, lane: int):
-        """A whole later chapter for a side lane: the listened book's next chapters first, then the other books'."""
-        if lib.settings()["paused"] or mem_available_gb() < SIDE_LANE_MIN_GB:
+    def _side_job(self, lane: int, warm: bool = False):
+        """A whole later chapter for a side lane: the listened book's next chapters first, then the other books'.
+        Starting a lane needs memory to spare; a lane already running (its voice process loaded) only needs to
+        stay clear of the floor."""
+        if lib.settings()["paused"] or mem_available_gb() < (SIDE_LANE_STOP_GB if warm else SIDE_LANE_MIN_GB):
             return None                                # not enough memory to spare: lane 0 alone
         with self.claims_lock:
             for k, (m, ch0, _u0) in enumerate(self._order()):
@@ -142,26 +144,31 @@ class Worker(threading.Thread):
                     if lib.chapter_status(m["id"], c["index"], c["n_segments"]).count(False) == 0:
                         continue
                     self.claims[key] = lane
+                    log.info("lane %d: %s, chapter %d", lane, m["id"], c["index"])
                     return m, lib.chapter(m["id"], c["index"])
         return None
 
     def _side_lane(self, lane: int) -> None:
         log.info("lane %d started", lane)
+        warm = False
         while lane <= self.side_wanted:
             job = None
             try:
-                job = self._side_job(lane)
+                job = self._side_job(lane, warm)
                 if job is None:
                     self.lane_jobs.pop(lane, None)
                     time.sleep(10)
                     continue
                 m, chap = job
+                warm = True
                 for s in range(len(chap["segments"])):
                     if lane > self.side_wanted or self.lane0_at == (m["id"], chap["index"]) or lib.settings()["paused"] \
                             or mem_available_gb() < SIDE_LANE_STOP_GB:
+                        log.info("lane %d leaves chapter %d (lane 0 is there, fewer lanes, paused, or memory)", lane, chap["index"])
                         break                              # fewer lanes, the listener came here, or memory is tight
                     if not lib.segment_ready(m["id"], chap["index"], s):
                         if self.render_segment(m, chap, s, lane=lane) is False:
+                            log.info("lane %d leaves chapter %d mid-piece", lane, chap["index"])
                             break
             except Exception:  # noqa: BLE001
                 log.error("lane %d render failed: %s", lane, traceback.format_exc())
@@ -317,10 +324,13 @@ class Worker(threading.Thread):
         out = lib.audio_dir(m["id"], chap["index"])
         out.mkdir(parents=True, exist_ok=True)
         wav = out / f"{s}.wav"                       # kept until the whole chapter is joined into one file
-        tl = assemble(units, metas, cache, wav, lead_in=0.0)
+        tmp = out / f"{s}.lane{lane}.wav"            # two lanes can finish the same piece: never share a file
+        tl = assemble(units, metas, cache, tmp, lead_in=0.0)
         with self._lock_for(m["id"], chap["index"]):
             if lib.segment_ready(m["id"], chap["index"], s):
+                tmp.unlink(missing_ok=True)
                 return                                   # another lane finished it first
+            tmp.replace(wav)
             _encode([wav], out / f"{s}.m4a")
         units_out = []
         for k, (u, ut) in enumerate(zip(units, tl["units"])):
@@ -343,7 +353,7 @@ class Worker(threading.Thread):
 
     def _prefetch(self, eng, chap: dict, seg: dict, cache: Path) -> dict:
         """Pocket: start take 0 of every sentence of this segment not yet cached, in parallel worker processes.
-        Their number follows the CPU setting: Low 1, Medium 3, High 5 (each uses one core)."""
+        One process per render lane (Low 1, Medium 2, High 3)."""
         from .engine import drop_pool, synth_pool
         from .render import _seed, unit_key
         if getattr(eng, "kind", "") != "pocket":

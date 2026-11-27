@@ -144,7 +144,8 @@ def status():
 @app.get("/api/system")
 def system():
     worker.status["lanes"] = [dict(j) for j in worker.lane_jobs.values()]
-    return dict(worker=worker.status, settings=lib.settings(), queue=worker.queue())
+    from . import machine
+    return dict(worker=worker.status, settings=lib.settings(), queue=worker.queue(), machine=machine.snapshot())
 
 
 class SystemIn(BaseModel):

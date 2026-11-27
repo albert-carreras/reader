@@ -1011,7 +1011,7 @@ const player = {
   hide() {
     document.body.classList.remove("has-player");
     this.wake(false);
-    removeEventListener("scroll", this.onScroll);
+    scrolling.detach();
     cancelAnimationFrame(this.raf);
     this.raf = 0;
     this.root = null;
@@ -1519,23 +1519,33 @@ const player = {
         this.$.play,
         ctrl(skipIcon(1), `Forward ${prefs.skip} s`, () => this.skip(1)),
         ctrl(ICON.list, "Chapters", (e) => this.sheet("chapters", e))));
-    this.$.follow = h("button", { class: "follow", hidden: true, onclick: () => { this.follow = true; this.$.follow.hidden = true; this.scrollToCur(true); } }, "Back to narrator");
+    this.$.follow = h("button", { class: "follow", "aria-hidden": "true", tabindex: "-1", onclick: () => { this.following(true); this.scrollToCur(true); } }, "Back to narrator");
     const main = h("main", { class: "reader", "data-key": `${b.id}:${ch.index}:${sig(ch)}` }, page);
     this.root = main;
     mount(top, main, this.$.follow, this.$.status, bar);
-    // the header gets out of the way while reading down, and comes back when scrolling up
-    let lastY = scrollY;
-    removeEventListener("scroll", this.onScroll);
-    this.onScroll = () => {
-      const y = scrollY;
-      if (y > lastY + 4 && y > 120) top.classList.add("hide");
-      else if (y < lastY - 4 || y < 60) top.classList.remove("hide");
-      lastY = y;
-    };
-    addEventListener("scroll", this.onScroll, { passive: true });
-    const stopFollow = () => { if (!audio.paused && prefs.follow) { this.follow = false; this.$.follow.hidden = false; } };
-    main.addEventListener("wheel", stopFollow, { passive: true });
-    main.addEventListener("touchmove", stopFollow, { passive: true });
+    scrolling.attach(top);          // the bar slides away as you read down and back as you scroll up
+    if (!this.follow && prefs.follow) this.following(false);       // a new chapter's page, still not following
+  },
+  // follow the narration (scroll the text along) or not; when not, a pill offers to go back to it
+  following(on) {
+    this.follow = on;
+    const pill = this.$?.follow;
+    if (!pill) return;
+    pill.classList.toggle("show", !on);
+    pill.setAttribute("aria-hidden", String(on));
+    pill.tabIndex = on ? -1 : 0;
+  },
+  // you scrolled the text yourself (a real scroll, not the wobble of a tap): stop moving it under you
+  userScrolled() {
+    if (this.root && this.follow && prefs.follow && !audio.paused) this.following(false);
+  },
+  // your scroll came to rest: if the narrator is right there on screen again, follow it again
+  scrollSettled() {
+    if (!this.root || this.follow || !prefs.follow) return;
+    const el = this.unitEls[this.cur];
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (r.top > innerHeight * 0.1 && r.top < innerHeight * 0.6) this.following(true);
   },
 
   // the reader's nav bar: back, the book and chapter, and one button on the right
@@ -1949,7 +1959,7 @@ const player = {
   },
   scrollToCur(force) {
     const el = this.unitEls[this.cur];
-    if (!el) return;
+    if (!el || (!force && scrolling.touching)) return;          // never move the text from under a finger
     const r = el.getBoundingClientRect(), vh = innerHeight;
     if (force || r.top < vh * 0.18 || r.bottom > vh * 0.62) el.scrollIntoView({ behavior: force ? "auto" : "smooth", block: el.offsetHeight > vh * 0.5 ? "start" : "center" });
   },
@@ -1990,7 +2000,7 @@ const player = {
         const c = cl ? cl.els[Math.max(0, cl.starts.findLastIndex((s) => s <= Math.max(k, 0)))] : null;
         if (c !== this.curClause) { this.curClause?.classList.remove("cur"); c?.classList.add("cur"); this.curClause = c; }
         // follow long sentences word by word
-        if (w && this.follow && !audio.paused && !document.hidden) { const r = w.getBoundingClientRect(); if (r.bottom > innerHeight * 0.66 || r.top < innerHeight * 0.12) w.scrollIntoView({ behavior: "smooth", block: "center" }); }
+        if (w && this.follow && !audio.paused && !document.hidden && !scrolling.touching) { const r = w.getBoundingClientRect(); if (r.bottom > innerHeight * 0.66 || r.top < innerHeight * 0.12) w.scrollIntoView({ behavior: "smooth", block: "center" }); }
       }
     }
     this.paintTime();
@@ -2069,6 +2079,63 @@ const player = {
     this.positionState();
   },
 };
+
+// ------------------------------------------------------------------ the reader's bar slides with your scrolling
+// The bar moves away as you scroll down and comes back as you scroll up, the way Safari's bars do: it moves exactly
+// as far as you scroll, and when the scroll comes to rest it settles all the way in or out, whichever way you were
+// going. Only your own scrolling moves it (a scroll that started under your finger, and its momentum, or a trackpad):
+// the text scrolling along with the narration doesn't. It is always there at the top of the page, and the
+// rubber-band bounce at either end isn't scrolling.
+const scrolling = {
+  bar: null, off: 0, h: 0, y: 0, dir: 0, dist: 0, user: false, touching: false, timer: 0,
+  attach(bar) {
+    Object.assign(this, { bar, off: 0, h: 0, dist: 0, user: false, y: this.clamp(scrollY) });
+    this.paint(false);
+  },
+  detach() { this.bar = null; },
+  clamp(y) { return Math.min(Math.max(y, 0), Math.max(0, document.documentElement.scrollHeight - innerHeight)); },
+  paint(animate) {
+    if (!this.bar) return;
+    this.bar.style.transition = animate ? "transform .32s var(--ease), background-color .2s, border-color .2s" : "background-color .2s, border-color .2s";
+    this.bar.style.transform = this.off ? `translateY(${-this.off.toFixed(1)}px)` : "";
+  },
+  onScroll() {
+    const y = this.clamp(scrollY), dy = y - this.y;
+    this.y = y;
+    if (this.touching) this.user = true;               // the page is moving under the finger
+    if (this.user && dy) {
+      this.dir = Math.sign(dy);
+      this.dist += Math.abs(dy);
+      if (this.dist > 30) player.userScrolled();       // a real scroll, not the wobble of a tap
+    }
+    if (this.bar?.isConnected) {
+      this.h ||= this.bar.offsetHeight || 50;
+      let off = this.user ? Math.min(this.h, Math.max(0, this.off + dy)) : this.off;
+      off = Math.min(off, y);                          // at the top of the page it's always there
+      if (off !== this.off) { this.off = off; this.paint(false); }
+    }
+    this.later();
+  },
+  later() { clearTimeout(this.timer); this.timer = setTimeout(() => this.settle(), 160); },
+  // the scroll came to rest (finger up, momentum over): the bar goes all the way in or out
+  settle() {
+    clearTimeout(this.timer);
+    if (this.touching) return;
+    const was = this.user;
+    this.user = false; this.dist = 0;
+    if (was) player.scrollSettled();
+    if (!this.bar?.isConnected || this.off === 0 || this.off === this.h) return;
+    this.off = this.dir > 0 && this.y > this.h ? this.h : 0;
+    this.paint(true);
+  },
+};
+addEventListener("scroll", () => scrolling.onScroll(), { passive: true });
+addEventListener("scrollend", () => scrolling.settle());
+addEventListener("touchstart", (e) => { if (e.touches.length === 1) { scrolling.touching = true; scrolling.dist = 0; clearTimeout(scrolling.timer); } }, { passive: true });
+const fingerUp = (e) => { if (e.touches.length) return; scrolling.touching = false; scrolling.later(); };
+addEventListener("touchend", fingerUp, { passive: true });
+addEventListener("touchcancel", fingerUp, { passive: true });
+addEventListener("wheel", () => { scrolling.user = true; scrolling.later(); }, { passive: true });
 
 audio.addEventListener("ended", () => player.tape && player.onEnded());
 audio.addEventListener("error", () => player.onMediaError());

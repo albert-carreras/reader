@@ -110,7 +110,6 @@ button, .iconbtn, .btn, .segctl, .switch, .player, .chip-status, .top, .mini, .c
   transition: transform .25s ease, background-color .2s, border-color .2s; view-transition-name: top; }
 .top.scrolled { background: color-mix(in srgb, var(--bg) 78%, transparent); border-bottom-color: var(--line);
   backdrop-filter: saturate(1.8) blur(20px); -webkit-backdrop-filter: saturate(1.8) blur(20px); }
-.top.hide { transform: translateY(-100%); }
 /* like UINavigationBar: the title is centred on the bar whatever the buttons beside it are */
 .top .wrap { display: flex; align-items: center; justify-content: space-between; height: var(--top-h); gap: .25rem; position: relative; }
 .top .lead { display: flex; align-items: center; min-width: 0; max-width: 42%; }
@@ -324,8 +323,11 @@ h2.section { font-size: .8rem; text-transform: uppercase; letter-spacing: .02em;
   box-shadow: var(--shadow); font-size: .86rem; white-space: nowrap; animation: pop-in .25s var(--ease); }
 .waiting .spinner { width: 16px; height: 16px; }
 @keyframes pop-in { from { opacity: 0; transform: translateY(6px) scale(.97); } }
-.follow { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--player-h) + env(safe-area-inset-bottom) + .6rem); z-index: 31;
-  padding: .55rem 1rem; border-radius: 999px; background: var(--ink); color: var(--bg); font-size: .88rem; font-weight: 600; box-shadow: var(--shadow); }
+.follow { position: fixed; left: 50%; bottom: calc(var(--player-h) + env(safe-area-inset-bottom) + .6rem); z-index: 31;
+  padding: .55rem 1rem; border-radius: 999px; background: var(--ink); color: var(--bg); font-size: .88rem; font-weight: 600; box-shadow: var(--shadow);
+  transform: translate(-50%, 10px) scale(.96); opacity: 0; pointer-events: none; transition: opacity .2s, transform .3s var(--ease); }
+.follow.show { transform: translate(-50%, 0); opacity: 1; pointer-events: auto; }
+.follow:active { transform: translate(-50%, 0) scale(.96); }
 .follow[hidden], #drop[hidden] { display: none; }
 
 /* ---------------------------------------------------------------- sheets: up from the bottom, drag down to close */

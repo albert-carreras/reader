@@ -104,20 +104,21 @@ def cmd_say(a):
     from .textnorm import speak
     eng = Engine(a.lang, a.voice)
     spoken = speak(a.text, a.lang)
-    audio = trim(eng.synth(spoken, seed=a.seed, temperature=a.temperature))
+    audio = trim(eng.synth(spoken, seed=a.seed))
     sf.write(a.out, audio, SR)
     print(spoken, prosody.features(audio))
 
 
 def cmd_qa(a):
     """Rank rendered sentences by how likely they sound wrong, with chapter timestamps to listen at in the app."""
-    import hashlib
     from . import library as lib
     from .engine import Engine
+    from .render import ctx_id, key_for
     books = [m for m in lib.list_books() if not a.book or a.book.lower() in (m["id"] + " " + m["title"]).lower()]
     for m in books:
-        ek, cache = Engine.key_for(m["lang"], m["voice"]), lib.CACHE / m["voice"]
-        found, checked = [], 0
+        eng = Engine(m["lang"], m["voice"])
+        ek, cache = eng.key, lib.CACHE / eng.voice
+        found, checked, missing = [], 0, 0
         for c in m["chapters"]:
             if not c["n_units"]:
                 continue
@@ -129,12 +130,20 @@ def cmd_qa(a):
                 if not part:
                     break                       # not rendered from here on (timestamps would be guesses)
                 for ut in part["units"]:
-                    u = chap["units"][ut["i"]]
-                    meta = lib._read(cache / (hashlib.sha1(f"{ek}|{u['kind']}|{u['spoken']}".encode()).hexdigest()[:16] + ".json"))
+                    i = ut["i"]
+                    u = chap["units"][i]
+                    # the take that was used: recorded in the timeline since 2026-11-27; before that, the take that
+                    # heard the sentence before it (context), else the one rendered without (a chapter start, a jump)
+                    keys = ([ut["key"]] if ut.get("key") else []) + [
+                        key_for(ek, u["kind"], u["spoken"], ctx_id(chap["units"][i - 1]) if i else ""), key_for(ek, u["kind"], u["spoken"])]
+                    meta = next((x for x in (lib._read(cache / f"{k}.json") for k in keys) if x), None)
                     if not meta:
+                        missing += 1
                         continue
                     checked += 1
                     issues, f = [], meta.get("features") or {}
+                    if not meta["words"]:
+                        issues.append((4, "no word timings (the aligner found nothing)"))
                     if "UNVERIFIED" in meta["flags"]:
                         issues.append((5, "unverified: " + next((x.split(": ", 1)[1] for x in meta["flags"] if x.startswith("take")), "")))
                     unclear = [w["word"] for w in meta["words"] if len(w["word"]) >= 3 and w["score"] < 0.3]
@@ -150,7 +159,8 @@ def cmd_qa(a):
                         found.append((max(i[0] for i in issues), c["title"], offset + ut["t0"], "; ".join(i[1] for i in issues), u["spoken"]))
                 offset += part["duration"]
         found.sort(key=lambda x: (-x[0], x[1], x[2]))
-        print(f"\n{m['title']} ({m['voice']}): {len(found)} of {checked} rendered sentences worth a listen")
+        print(f"\n{m['title']} ({eng.voice}): {len(found)} of {checked} rendered sentences worth a listen"
+              + (f" ({missing} more without a cached take)" if missing else ""))
         for sev, title, t, why, text in found[: a.limit]:
             print(f"  {title[:24]:24s} {int(t // 60):3d}:{int(t % 60):02d}  {why}\n      {text[:110]}")
 
@@ -166,7 +176,7 @@ def main(argv=None):
     s.add_argument("-o", "--out", default=str(Path.home() / "reader" / "renders")); s.add_argument("-t", "--threads", type=int, default=4)
     s.add_argument("--nice", type=int, default=10); s.add_argument("--verbose", action="store_true"); s.set_defaults(fn=cmd_render)
     s = sub.add_parser("say"); s.add_argument("text"); s.add_argument("-l", "--lang", default="es"); s.add_argument("-v", "--voice")
-    s.add_argument("-s", "--seed", type=int, default=0); s.add_argument("-T", "--temperature", type=float, default=0.3)
+    s.add_argument("-s", "--seed", type=int, default=0)
     s.add_argument("-o", "--out", default="say.wav"); s.set_defaults(fn=cmd_say)
     s = sub.add_parser("qa"); s.add_argument("book", nargs="?"); s.add_argument("-n", "--limit", type=int, default=25); s.set_defaults(fn=cmd_qa)
     a = p.parse_args(argv)

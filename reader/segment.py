@@ -9,7 +9,8 @@ from .book import Block, Chapter
 from .textnorm import speak
 
 RAYA = "—―"
-MAX_CHARS = 1500         # Phonon reads 2,700-char sentences cleanly; only split beyond this (clauses first)
+MAX_CHARS = 1500         # only split beyond this (clauses first). Set when Phonon read 2,700-char sentences cleanly;
+                         # with Pocket nothing over 434 chars has been rendered yet (2026-11-27): listen to the first long ones
 WH = {
     "es": r"((pero|y|e|o|pues|entonces|mas)\s+)?((a|de|en|por|para|con|hacia|desde|hasta|sin|sobre|entre)\s+)?(qu[ée]|qui[ée]n(es)?|c[óo]mo|d[óo]nde|ad[óo]nde|cu[áa]ndo|cu[áa]nt[oa]s?|cu[áa]l(es)?|por qu[ée]|para qu[ée]|de d[óo]nde|a qui[ée]n|con qui[ée]n|de qui[ée]n|en qu[ée]|a qu[ée])",
     "en": r"((but|and|so|then|oh|well)\s*,?\s+)?(what|who|whom|whose|which|where|when|why|how)",

@@ -1,7 +1,7 @@
 [project]
 name = "reader"
 version = "0.1.0"
-description = "Self-hosted read-along audiobooks: EPUB -> natural narration (Phonon) with sentence/word timing"
+description = "Self-hosted read-along audiobooks: EPUB -> natural narration (Pocket TTS) with sentence/word timing"
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.12",
@@ -9,7 +9,6 @@ dependencies = [
     "lxml>=5",
     "numpy>=1.26",
     "soundfile>=0.12",
-    "ptts",                 # Phonon TTS runtime (CPU)
     "zyphra-textnorm",      # NeMo text-normalization grammars (numbers, dates, roman numerals, abbreviations)
     "pysbd",                # sentence boundary detection (en/es)
     # verification ASR

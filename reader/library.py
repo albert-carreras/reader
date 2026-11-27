@@ -317,8 +317,14 @@ def progress(m: dict) -> dict:
             st = chapter_status(m["id"], c["index"], c["n_segments"])
             if st:
                 ready += c["est"] * sum(st) / len(st)
+    # your place: the chapters before yours, and how far into yours you are (by sentence)
     pos = position(m["id"]) or {}
-    heard = sum(c["est"] for c in m["chapters"] if c["include"] and c["index"] < pos.get("chapter", 0))
+    heard = 0.0
+    for c in m["chapters"]:
+        if c["include"] and c["index"] < pos.get("chapter", 0):
+            heard += c["est"]
+        elif c["include"] and c["index"] == pos.get("chapter") and c.get("n_units"):
+            heard += c["est"] * min(1.0, pos.get("unit", 0) / c["n_units"])
     return dict(total_est=round(total), ready_est=round(ready), heard_est=round(heard))
 
 
@@ -405,7 +411,7 @@ def _size(p: Path) -> int:
 
 def _live_take_keys() -> set[str]:
     """Cache keys every book still needs with its current engine (voice, pace, version)."""
-    from .engine import CONTEXT, Engine, engine_of
+    from .engine import CONTEXT, Engine
     from .render import ctx_id, key_for
     keys = set()
     for mp in BOOKS.glob("*/meta.json"):
@@ -413,7 +419,7 @@ def _live_take_keys() -> set[str]:
         if not m:
             continue
         ek = Engine.key_for(m["lang"], m["voice"])
-        context = engine_of(m["lang"], m["voice"]) == "pocket" and CONTEXT
+        context = CONTEXT
         for c in m["chapters"]:
             if not c["n_units"]:
                 continue

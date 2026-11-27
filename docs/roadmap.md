@@ -30,6 +30,24 @@
 
 **Engine change (2026-11-27):** blind intonation reels on both books picked **Pocket TTS** (Kyutai, 100M) over every Phonon voice. Phonon's catalog voices are all assistant and ad reads; Pocket ships LibriVox-narrator prompts. Now `caro_davy` (en) and `lola` (es). Phonon is still selectable. Pocket speaks on one core, so first takes run in parallel worker processes: ~2x realtime at Medium.
 
+**After the v1 feedback (2026-11-27, evening):**
+- Phonon removed (no book used it): the engine is Pocket only; its weights and the 24-layer Spanish candidate are
+  deleted from the model cache
+- a second take only for a wrong ending (measured on 2,208 takes: 62% of yes/no questions didn't rise, 1% of
+  statements rose), before the pitch fix; ~4% more synthesis
+- `reader qa` finds the takes rendered with context (it saw 7 of 2,207 sentences; now all), and timelines record
+  the take each sentence used
+- side lanes hold while the part you're listening to renders (a second chain slows the first by ~10%)
+- the rendering page shows speed per lane next to the whole-book time; every book has a state (rendered, rendering,
+  queued, paused, off); the chip says when books are switched off instead of "All rendered"
+- progress counts your place inside the chapter, and the bars say which layer is your place and which is rendered
+- the book page drops its Continue button when the now-playing bar already holds that book
+- the reader asks for animation frames only while playing, and makes word spans only around the narration (a long
+  chapter had ~7,000 made up front)
+- not done: a pace setting (Pocket has no speed control; we measure ~176 wpm with pauses, and the player's speed
+  covers it), a language/voice confirmation step before rendering (the first 30 s piece is ready in about half a
+  minute and changing either costs only that), flagging empty alignments (none in 2,208 takes)
+
 **Next:**
 - **Done (round 2):** previous-sentence context. Each sentence's voice prompt is the reference clip plus the end of the sentence before, picked blind in both languages over plain takes and over cloned LibriVox narrators. Rendering becomes a chain, ~1.0–1.15x realtime at Medium.
 - faster context rendering: run separate chains on different chapters in parallel (a chapter start needs no context)

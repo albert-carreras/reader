@@ -18,7 +18,6 @@ along: the sentence highlighted, the word underlined. English and Spanish.
 - **Voice.** [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) (Kyutai, 100M) with its LibriVox-narrator
   voices: `caro_davy` for English, `lola` for Spanish.
   - Both were picked in blind listening tests over [Phonon](https://gradium.ai/phonon), Kokoro and calmer voices.
-  - Phonon is still selectable per book.
 - **Previous-sentence context.** Each sentence's voice prompt includes the end of the sentence before. The narration
   flows instead of every sentence starting the same way.
 - **Text that reads right.**
@@ -29,7 +28,8 @@ along: the sentence highlighted, the word underlined. English and Spanish.
   - Every sentence is force-aligned against its text (MMS). Mumbled, skipped or babbled takes are re-rendered, and the
     alignment provides the word timings.
   - Dead air inside a take is shortened.
-  - A wrong sentence ending (a statement rising, a question falling) gets a gentle pitch fix.
+  - A wrong sentence ending (a statement rising, a yes/no question not rising) gets a second take; if that one ends
+    wrong too, a gentle pitch fix. Everything else is a single take (preferred blind).
 - **Mastered like an audiobook.** Even loudness, peaks below −3 dB, room tone in the pauses, pauses scaled to sentence
   and paragraph length.
 
@@ -49,7 +49,8 @@ along: the sentence highlighted, the word underlined. English and Spanish.
 **Rendering**
 - **Renders from where you are listening.** The next pieces come first, so you rarely wait. Pieces are 30 s, so a part
   that isn't rendered yet starts within about half a minute.
-- **Several chapters at once** (the CPU setting picks how many), each its own chain of context.
+- **Several chapters at once** (the CPU setting picks how many), each its own chain of context. The extra chapters
+  hold while the part you're listening to is still rendering, so it arrives sooner.
 - **Runs at low priority and gives its memory back** (~5 GB → ~0.3 GB) after 5 idle minutes. The service has a
   memory limit (`MemoryMax=7G`), and extra lanes only start when the laptop has memory to spare.
 - **The rendering page shows the laptop:** CPU and memory (the reader's share next to everything else's, and its

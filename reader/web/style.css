@@ -81,6 +81,7 @@ button, .iconbtn, .btn, .segctl, .switch, .player, .chip-status { touch-action: 
 .chip-status[data-state="rendering"] .chip-ico i:nth-child(3) { animation-delay: -.66s; }
 .chip-status[data-state="idle"] .chip-ico { color: var(--ok); }
 .chip-status[data-state="error"] .chip-ico { color: var(--bad); }
+.chip-status[data-state="queued"] .chip-ico { color: var(--warn); }
 .chip-status.skeleton .chip-txt { color: transparent; border-radius: 6px; background: linear-gradient(90deg, var(--surface-2), var(--line), var(--surface-2)); background-size: 200% 100%; animation: shimmer 1.2s linear infinite; }
 @keyframes eq { 0%, 100% { height: 4px; } 50% { height: 14px; } }
 @keyframes shimmer { to { background-position: -200% 0; } }
@@ -304,4 +305,8 @@ svg.spin { animation: spin .9s linear infinite; }
 .mrow .muted.small { display: flex; flex-wrap: wrap; column-gap: 1rem; row-gap: .2rem; }
 .key { display: inline-flex; align-items: center; gap: .4rem; white-space: nowrap; }
 .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
+/* the two layers of a progress bar: your place (solid) over what is rendered (light) */
+.legend { display: flex; flex-wrap: wrap; column-gap: 1rem; row-gap: .2rem; margin-top: .5rem; }
+.sw.heard { background: var(--accent); }
+.sw.ready { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 .mrow .hot { color: var(--bad); }

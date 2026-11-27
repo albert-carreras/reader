@@ -34,6 +34,9 @@ def _give_back() -> None:
 # a side lane costs one more voice process (~1.5-2 GB): start one only with room for it under the service's limit
 # (and on the machine), and leave a chapter when the room gets thin
 SIDE_LANE_MIN_GB, SIDE_LANE_STOP_GB = 2.5, 1.0
+# A second chain slows the first by ~10% (2,208 takes, 2026-11-27: 0.71x realtime alone, 0.63x with another
+# chapter rendering). One chain is slower than realtime, so a listener inside a chapter that is still rendering
+# catches up and waits: side lanes hold while lane 0 renders the piece they're on or the next one.
 
 
 def lanes_for(threads: int) -> int:
@@ -82,6 +85,7 @@ class Worker(threading.Thread):
         self.side_wanted = 0
         self._side: dict[int, threading.Thread] = {}
         self._chapter_locks: dict[tuple[str, int], threading.Lock] = {}
+        self._lane0_segs: list[dict] = []                   # the pieces of the chapter lane 0 is on
 
     # ---------------------------------------------------------------- scheduling
     def set_focus(self, book_id: str, chapter: int, unit: int) -> None:
@@ -194,20 +198,36 @@ class Worker(threading.Thread):
                 self._side[lane].start()
         self.status["lanes"] = [dict(j) for j in self.lane_jobs.values()]
 
+    def listener_waiting(self) -> bool:
+        """Lane 0 is rendering the piece the listener is on, or the next one: they are waiting for it, or soon will."""
+        job, f = self.status.get("job"), self.focus
+        if self.status.get("state") != "rendering" or not job or not f or (job["book"], job["chapter"]) != f[:2]:
+            return False
+        at = next((k for k, sg in enumerate(self._lane0_segs) if sg["u0"] <= f[2] < sg["u1"]), None)
+        return at is not None and at <= job["segment"] <= at + 1
+
+    def rendering_books(self) -> set[str]:
+        return {j["book"] for j in [self.status.get("job") or {}, *self.lane_jobs.values()] if j.get("book")}
+
     def queue(self) -> list[dict]:
-        """Every book with its rendering state, progress and an ETA at the current speed."""
+        """Every book with its rendering state, progress and an ETA at the current speed.
+        state: done (all rendered) · off (switched off for this book) · paused (all rendering is paused) ·
+        rendering (a lane is on it now) · queued (next in line)."""
         rate = (self.status.get("rate") or 1.0) * max(1, 1 + len(self.lane_jobs))   # every lane's output
         out, ahead = [], 0.0
         order = [m for m, *_ in self._order()]
         rest = [m for m in lib.list_books() if m["id"] not in {o["id"] for o in order}]
+        paused, busy = lib.settings()["paused"], self.rendering_books()
         for m in order + rest:
             p = lib.progress(m)
             left = max(0, p["total_est"] - p["ready_est"])
+            on = m.get("render", True)
             eta = None
-            if m.get("render", True) and left:
+            if on and left:
                 ahead += left / max(rate, 0.1)
                 eta = round(ahead)
-            out.append(dict(id=m["id"], title=m["title"], lang=m["lang"], render=m.get("render", True),
+            state = "done" if left <= 1 else "off" if not on else "paused" if paused else "rendering" if m["id"] in busy else "queued"
+            out.append(dict(id=m["id"], title=m["title"], lang=m["lang"], render=on, state=state,
                             ready=p["ready_est"], total=p["total_est"], eta=eta))
         return out
 
@@ -215,8 +235,7 @@ class Worker(threading.Thread):
     def _apply_threads(self):
         n = lib.settings()["threads"]
         if n != getattr(self, "_threads", None):
-            import ptts, torch
-            ptts.set_num_threads(n)
+            import torch
             torch.set_num_threads(n)
             self._threads = n
             self.status["threads"] = n
@@ -269,6 +288,7 @@ class Worker(threading.Thread):
         job = dict(book=m["id"], title=m["title"], chapter=chap["index"], chapter_title=chap["title"],
                    segment=s, of=len(chap["segments"]), units=seg["u1"] - seg["u0"], done=0, est=seg["est"], started=time.time())
         if lane == 0:
+            self._lane0_segs = chap["segments"]
             self.status.update(state="rendering", error=None, job=job)
         else:
             self.lane_jobs[lane] = job
@@ -295,6 +315,13 @@ class Worker(threading.Thread):
                 ahead[j] = f
         try:
             for i in range(seg["u0"], seg["u1"]):
+                if lane and self.listener_waiting():
+                    job["held"] = True                       # the listener needs lane 0's speed: hold, keep the chapter
+                    while self.listener_waiting() and lane <= self.side_wanted and self.lane0_at != (m["id"], chap["index"]):
+                        time.sleep(1)
+                    job["held"] = False
+                    if lane > self.side_wanted or self.lane0_at == (m["id"], chap["index"]):
+                        return False                     # lane 0 came here meanwhile (or fewer lanes now)
                 u = _unit(chap, i)
                 ctx = (ctx_id(prev_u), prev_audio) if chain and prev_u is not None and prev_audio is not None else None
                 first = firsts.get(i) or ahead.pop(i, None)
@@ -340,7 +367,7 @@ class Worker(threading.Thread):
         units_out = []
         for k, (u, ut) in enumerate(zip(units, tl["units"])):
             text = chap["blocks"][u.block]["text"]
-            units_out.append(dict(i=seg["u0"] + k, t0=ut["t0"], t1=ut["t1"],
+            units_out.append(dict(i=seg["u0"] + k, key=ut["key"], t0=ut["t0"], t1=ut["t1"],
                                   words=timing.map_words(text, u.start, u.end, ut["words"], ut["t0"], ut["t1"])))
         with self._lock_for(m["id"], chap["index"]):
             lib._write(out / f"{s}.json", dict(duration=tl["duration"], units=units_out))
@@ -358,12 +385,10 @@ class Worker(threading.Thread):
             return self._chapter_locks.setdefault((book_id, ch), threading.Lock())
 
     def _prefetch(self, eng, chap: dict, seg: dict, cache: Path) -> dict:
-        """Pocket: start take 0 of every sentence of this segment not yet cached, in parallel worker processes.
-        One process per render lane (Low 1, Medium 2, High 3)."""
+        """Without context: start take 0 of every sentence of this segment not yet cached, in parallel worker
+        processes. One process per render lane (Low 1, Medium 2, High 3)."""
         from .engine import drop_pool, synth_pool
         from .render import _seed, unit_key
-        if getattr(eng, "kind", "") != "pocket":
-            return {}
         pool = synth_pool(lanes_for(lib.settings()["threads"]))
         out = {}
         try:
@@ -417,7 +442,7 @@ class Worker(threading.Thread):
         for s, w in enumerate(wavs):
             seg = lib._read(out / f"{s}.json")
             for u in seg["units"]:
-                units.append(dict(i=u["i"], t0=round(u["t0"] + offset, 3), t1=round(u["t1"] + offset, 3),
+                units.append(dict(u, t0=round(u["t0"] + offset, 3), t1=round(u["t1"] + offset, 3),
                                   words=[[a, b, round(t0 + offset, 3), round(t1 + offset, 3)] for a, b, t0, t1 in u["words"]]))
             offset += sf.info(str(w)).frames / sf.info(str(w)).samplerate
         _encode(wavs, out / "full.m4a")

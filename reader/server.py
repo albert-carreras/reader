@@ -36,7 +36,7 @@ ACCESS_TEAM = os.environ.get("READER_ACCESS_TEAM", "")       # e.g. bertini.clou
 ACCESS_AUD = os.environ.get("READER_ACCESS_AUD", "")         # Application Audience (AUD) tag; optional but recommended
 PUBLIC_HOSTS = {h for h in os.environ.get("READER_PUBLIC_HOSTS", "reader.bored.cat").split(",") if h}
 
-VOICES = engine_voices        # Pocket first (the default engine), then Phonon
+VOICES = engine_voices
 
 app = FastAPI(title="reader", docs_url=None, redoc_url=None, openapi_url=None)
 worker = Worker()
@@ -133,11 +133,11 @@ def _book_or_404(book_id: str) -> dict:
 def status():
     worker.status["lanes"] = [dict(j) for j in worker.lane_jobs.values()]
     st = dict(worker=worker.status, focus=worker.focus, settings=lib.settings())
+    q = worker.queue()
     job = worker.status.get("job")
     if job:
-        q = next((b for b in worker.queue() if b["id"] == job["book"]), None)
-        if q:
-            st["book"] = q
+        st["book"] = next((b for b in q if b["id"] == job["book"]), None)
+    st["books"] = {k: sum(b["state"] == k for b in q) for k in ("done", "off", "rendering", "queued", "paused")}
     return st
 
 
@@ -228,9 +228,10 @@ def get_book(book_id: str):
     m["langs"] = lib.LANGS
     q = next((b for b in worker.queue() if b["id"] == book_id), None)
     m["eta"] = q and q["eta"]
-    job = worker.status.get("job") or {}
-    m["rendering_now"] = job.get("book") == book_id
-    m["rendering_at"] = job.get("chapter") if m["rendering_now"] else None   # which chapter, so "2% ready" has a where
+    m["state"] = q and q["state"]                     # done · off · paused · rendering · queued
+    jobs = [j for j in [worker.status.get("job") or {}, *worker.lane_jobs.values()] if j.get("book") == book_id]
+    m["rendering_now"] = bool(jobs)
+    m["rendering_at"] = sorted(j["chapter"] for j in jobs) or None   # which chapters, so "2% ready" has a where
     return m
 
 

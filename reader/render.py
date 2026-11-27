@@ -16,14 +16,13 @@ from .engine import SR, Engine, trim
 from .segment import Unit
 
 import os
-MAX_TAKES = int(os.environ.get("READER_MAX_TAKES", "4"))
-TEMPS = [0.3, 0.5, 0.5, 0.7]
-MIN_SPEECH_TAKES = int(os.environ.get("READER_SPEECH_TAKES", "2"))
 RESHAPE = os.environ.get("READER_RESHAPE", "mild")      # off | mild | strong
-EXTRA_TAKES = int(os.environ.get("READER_EXTRA_TAKES", "3"))   # more seeds when no take passes verification
-RETRY_TEMPS = [0.4, 0.5, 0.6]
-# Phonon sometimes stops for 1-3 s of digital silence in the middle of long inputs (measured: 20 of 76 long Spanish
-# takes had 0.8-3.4 s). Any quiet stretch longer than SQUASH_OVER inside a take is shortened to SQUASH_TO.
+# One take per sentence (Pocket's single takes were preferred blind), with one exception: a take whose ending goes
+# the wrong way for its kind gets a second seed before the pitch fix. Measured on 2,208 takes (2026-11-27): 62% of
+# yes/no questions didn't rise, 1% of statements rose, 5% of wh-questions rose. About 4% more synthesis in all.
+SECOND_TAKE = os.environ.get("READER_SECOND_TAKE", "1") == "1"
+# Dead air: any quiet stretch longer than SQUASH_OVER inside a take is shortened to SQUASH_TO (first seen with
+# Phonon, which stopped for 1-3 s mid-sentence; kept as a guard for any take).
 SQUASH_OVER, SQUASH_TO, SQUASH_DB = 0.7, 0.4, -45.0
 # kind -> (needs fixing?, target final delta in semitones for mild / strong)
 RESHAPE_RULES = {
@@ -33,20 +32,11 @@ RESHAPE_RULES = {
 }
 
 
-def acceptable(kind: str, f: dict | None) -> bool:
-    """Is this contour good enough to stop generating more takes?"""
-    if f is None:
-        return False
-    d = f["final_delta"]
-    return {
-        "statement": d < -1.0,
-        "yesno": d > 3.0,
-        "wh": d < 1.0,
-        "exclaim": f["range_st"] > 6.0,
-        "continuation": d > -5.0,
-        "trailing": d > -5.5,
-        "heading": d < 0.5,
-    }.get(kind, True)
+def wrong_ending(kind: str, f: dict | None) -> bool:
+    """The take ends the wrong way for its kind (a statement rising, a yes/no question not rising): the same test
+    that sends a take to the pitch fix."""
+    rule = RESHAPE_RULES.get(kind)
+    return bool(rule and f and rule[0](f["final_delta"]))
 
 
 @dataclass
@@ -151,7 +141,8 @@ def final_audio(meta: dict, cache: Path) -> np.ndarray:
 def render_unit(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, first=None, ctx=None, on_first=None) -> dict:
     """`first`: a future holding take 0's raw audio, already being synthesized in a worker process.
     `ctx`: (ctx_id, audio) of the sentence before, for engines that use context.
-    `on_first(audio)`: called with take 0 as soon as it exists, so the next sentence can start meanwhile."""
+    `on_first(audio)`: called with take 0 as soon as it exists (unless a second take follows), so the next sentence
+    can start meanwhile."""
     ctx_key, ctx_audio = ctx if ctx is not None and getattr(eng, "uses_context", False) else ("", None)
     key = unit_key(u, eng, ctx_key)
     wav_p, meta_p = cache / f"{key}.wav", cache / f"{key}.json"
@@ -162,28 +153,22 @@ def render_unit(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, first=None
         _learn(stats, meta)
         return meta
     t0 = time.time()
-    takes = []
-    max_takes = MAX_TAKES if len(u.spoken) <= 400 else min(MAX_TAKES, 2)   # long sentences: contour matters less, cost more
-    lean = getattr(eng, "kind", "phonon") == "pocket"
-    if lean:        # Pocket's intonation was preferred blind as single takes: more only when verification fails
-        max_takes = 1
-    for k in range(max_takes):
-        audio = None
-        if k == 0 and first is not None:
-            try:
-                audio = first.result()
-            except Exception:  # noqa: BLE001  (a broken worker: synthesize here instead)
-                audio = None
-        t = _take(u, eng, stats, k, TEMPS[k], audio, ctx_audio)
-        takes.append(t)
-        if k == 0 and on_first is not None:
-            on_first(t["audio"])
-        min_takes = 1 if lean else MIN_SPEECH_TAKES if u.role == "speech" and len(u.spoken) >= 12 else 1
-        if k + 1 >= min_takes and acceptable(u.kind, t["f"]) and t["parts"].get("register", 0) > -0.5 and t["parts"].get("pace", 0) > -0.5:
-            break
+    audio = None
+    if first is not None:
+        try:
+            audio = first.result()
+        except Exception:  # noqa: BLE001  (a broken worker: synthesize here instead)
+            audio = None
+    takes = [_take(u, eng, stats, 0, audio, ctx_audio)]
+    if SECOND_TAKE and wrong_ending(u.kind, takes[0]["f"]):
+        takes.append(_take(u, eng, stats, 1, None, ctx_audio))      # the next sentence waits to hear the winner
+    elif on_first is not None:
+        on_first(takes[0]["audio"])
     synth_s = time.time() - t0
     flags = []
-    chosen = next((t for t in sorted(takes, key=lambda t: -t["score"]) if _verified(t, u.spoken, flags)), None)
+    # a right ending first (that's what a second take is for), then the score; the first of those that verifies
+    ranked = sorted(takes, key=lambda t: (wrong_ending(u.kind, t["f"]), -t["score"]))
+    chosen = next((t for t in ranked if _verified(t, u.spoken, flags)), None)
     if chosen is None:
         chosen = _retry(u, eng, stats, takes, flags, ctx_audio)
     sf.write(wav_p, chosen["audio"], SR, subtype="PCM_16")
@@ -194,11 +179,10 @@ def render_unit(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, first=None
     return meta
 
 
-def _take(u: Unit, eng: Engine, stats: VoiceStats, k: int, temp: float, raw: np.ndarray | None = None,
+def _take(u: Unit, eng: Engine, stats: VoiceStats, k: int, raw: np.ndarray | None = None,
           context: np.ndarray | None = None) -> dict:
     if raw is None:
-        raw = eng.synth(u.spoken, seed=_seed(u.spoken, k), temperature=temp, context=context) if context is not None \
-            else eng.synth(u.spoken, seed=_seed(u.spoken, k), temperature=temp)
+        raw = eng.synth(u.spoken, seed=_seed(u.spoken, k), context=context)
     audio, _ = squash_silence(trim(raw))
     f = prosody.features(audio)
     s, parts = score_take(u, audio, f, stats)
@@ -221,16 +205,13 @@ def _verified(t: dict, spoken: str, flags: list) -> bool:
 
 
 def _retry(u: Unit, eng: Engine, stats: VoiceStats, takes: list, flags: list, context: np.ndarray | None = None) -> dict:
-    """No take passed verification: try more seeds before settling. If none passes, the best-scoring take is kept
-    and flagged UNVERIFIED (listed by `reader qa`)."""
-    first = max(t["k"] for t in takes) + 1
-    extra = 1 if getattr(eng, "kind", "") == "pocket" else EXTRA_TAKES    # Pocket's failures are mostly the checker's
-    for k in range(first, first + extra):
-        t = _take(u, eng, stats, k, RETRY_TEMPS[(k - first) % len(RETRY_TEMPS)], None, context)
-        takes.append(t)
-        if _verified(t, u.spoken, flags):
-            flags.append("retried")
-            return t
+    """No take passed verification: one more seed before settling (Pocket's failures are mostly the checker's). If it
+    fails too, the best-scoring take is kept and flagged UNVERIFIED (listed by `reader qa`)."""
+    t = _take(u, eng, stats, max(t["k"] for t in takes) + 1, None, context)
+    takes.append(t)
+    if _verified(t, u.spoken, flags):
+        flags.append("retried")
+        return t
     flags.append("UNVERIFIED")
     return max(takes, key=lambda t: t["score"])
 

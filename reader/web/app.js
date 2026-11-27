@@ -307,6 +307,8 @@ const renderChip = () => {
         txt.textContent = st.book ? `Rendering · ${pct(st.book.ready, st.book.total)}%` : "Rendering";
       } else if (w.state === "paused") { ico.innerHTML = ICON2.pause; txt.textContent = "Paused"; }
       else if (w.state === "error") { ico.innerHTML = ICON2.warn; txt.textContent = "Needs attention"; }
+      else if (st.books?.queued) { chip.dataset.state = "queued"; ico.innerHTML = ICON2.pause; txt.textContent = "Queued"; }      // e.g. books being upgraded
+      else if (st.books?.off) { chip.dataset.state = "off"; ico.innerHTML = ICON2.pause; txt.textContent = `${st.books.off} book${st.books.off > 1 ? "s" : ""} off`; }
       else { ico.innerHTML = ICON2.check; txt.textContent = "All rendered"; }
     } catch { chip.dataset.state = "offline"; chip.querySelector(".chip-txt").textContent = "Offline"; }
   };
@@ -385,9 +387,10 @@ async function viewLibrary() {
       if (offline.bytes(b.id)) cv.append(h("span", { class: "dl-badge", title: "On this phone", html: ICON2.phone }));
       grid.append(h("a", { class: "card", href: `#/book/${b.id}` }, cv,
         h("div", {}, h("div", { class: "t" }, b.title), h("div", { class: "a" }, b.author)),
-        h("div", { class: "bar", title: `${human(p.ready_est)} of ${human(p.total_est)} ready` },
+        h("div", { class: "bar", title: `Your place: ${pct(p.heard_est, p.total_est)}% · rendered: ${pct(p.ready_est, p.total_est)}%`, "aria-label": `Your place ${pct(p.heard_est, p.total_est)}%, ${pct(p.ready_est, p.total_est)}% rendered` },
           h("i", { class: "ready", style: `width:${pct(p.ready_est, p.total_est)}%` }),
-          h("i", { style: `width:${pct(p.heard_est, p.total_est)}%` }))));
+          h("i", { style: `width:${pct(p.heard_est, p.total_est)}%` })),
+        p.heard_est > 0 ? h("div", { class: "a" }, `${pct(p.heard_est, p.total_est)}% · ${short(p.total_est - p.heard_est)} left`) : null));
     }
     main.append(grid);
   }
@@ -404,16 +407,24 @@ async function viewBook(id) {
   const p = b.progress;
   const done = p.ready_est >= p.total_est - 1;
   const top = topbar(back("#/", "Library"), null, renderChip(), gear());
+  const miniIsThis = (player.tape && player.book ? player.book.id : store.get("recent", null)?.id) === id;
 
-  const state = !b.render ? ["off", "Rendering is off for this book"] : done ? ["done", "Fully rendered"]
-    : b.rendering_now ? ["on", "Rendering now" + ((c) => c ? ` · ${chapterLabel(c.title, b.lang)}` : "")(b.chapters.find((c) => c.index === b.rendering_at))] : ["queued", "Queued"];
+  // complete · rendering · queued (another book first) · paused (all rendering) · off (this book only)
+  const st = done ? "done" : b.state || (!b.render ? "off" : b.rendering_now ? "rendering" : "queued");
+  const where = (b.rendering_at || []).map((n) => b.chapters.find((c) => c.index === n)).filter(Boolean).map((c) => chapterLabel(c.title, b.lang));
+  const state = { done: ["done", "Fully rendered"], off: ["off", "Off for this book"], paused: ["off", "Paused · all rendering is paused"],
+    rendering: ["on", "Rendering now" + (where.length ? ` · ${where.join(", ")}` : "")], queued: ["queued", "Queued · another book renders first"] }[st] || ["queued", "Queued"];
   const toggleRender = async () => { await api(`/api/books/${id}`, { method: "PATCH", body: JSON.stringify({ render: !b.render }) }); viewBook(id); };
+  const resumeAll = async () => { await api("/api/system", { method: "PUT", body: JSON.stringify({ paused: false }) }); viewBook(id); };
+  const legend = (cls, text) => h("span", { class: "key" }, h("i", { class: `sw ${cls}` }), text);
   const renderCard = h("section", { class: "card-box" },
     h("div", { class: "row-between" },
       h("div", {}, h("div", { class: "label" }, h("span", { class: `dot ${state[0]}` }), state[1]),
-        h("div", { class: "muted small" }, `${human(p.ready_est)} of ${human(p.total_est)} ready` + (b.render && !done && b.eta ? ` · about ${eta(b.eta)} to go` : ""))),
-      done ? null : h("button", { class: "btn ghost sm", onclick: toggleRender }, b.render ? "Pause" : "Start")),
-    h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(p.ready_est, p.total_est)}%` }), h("i", { style: `width:${pct(p.heard_est, p.total_est)}%` })));
+        h("div", { class: "muted small" }, `${human(p.ready_est)} of ${human(p.total_est)} rendered` + (b.render && !done && b.eta ? ` · about ${eta(b.eta)} to go` : ""))),
+      done ? null : st === "paused" ? h("button", { class: "btn sm", onclick: resumeAll }, "Resume")
+        : h("button", { class: "btn ghost sm", onclick: toggleRender }, b.render ? "Turn off" : "Turn on")),
+    h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(p.ready_est, p.total_est)}%` }), h("i", { style: `width:${pct(p.heard_est, p.total_est)}%` })),
+    h("div", { class: "legend muted small" }, legend("heard", `Your place · ${human(p.heard_est)}`), done ? null : legend("ready", `Rendered · ${human(p.ready_est)}`)));
 
   const list = h("ul", { class: "chapters" });
   for (const c of playable) {
@@ -468,7 +479,8 @@ async function viewBook(id) {
     h("section", { class: "book-hero" }, coverEl(b), h("div", {},
       h("h1", {}, b.title), h("div", { class: "by" }, b.author),
       h("div", { class: "muted small" }, `${b.langs[b.lang]} · ${human(p.total_est)}` + (pos && cur ? ` · at ${chapterLabel(cur.title, b.lang)}` : "")))),
-    cur ? h("a", { class: "btn wide", href: `#/read/${id}/${cur.index}?play`, html: ICON.play + `<span>${pos ? "Continue" : "Start listening"}</span>` }) : null,
+    // the now-playing bar already offers this book (play in place, tap to read): no second button for it
+    cur && !miniIsThis ? h("a", { class: "btn wide", href: `#/read/${id}/${cur.index}?play`, html: ICON.play + `<span>${pos ? "Continue" : "Start listening"}</span>` }) : null,
     renderCard, dlBox,
     h("h2", { class: "section" }, "Chapters"), list,
     h("h2", { class: "section" }, "Book"), settingsBox);
@@ -492,25 +504,30 @@ async function viewSystem() {
     if (!s) return;
     const w = s.worker, job = w.job, paused = s.settings.paused;
     const cur = job && s.queue.find((q) => q.id === job.book);
+    const lanes = (w.state === "rendering" ? 1 : 0) + (w.lanes || []).length;
+    const off = s.queue.filter((q) => q.state === "off").length;
     fill(statusBox, 
       h("div", { class: "row-between" },
         h("div", {}, h("div", { class: "label big" }, h("span", { class: `dot ${paused ? "off" : w.state === "rendering" ? "on" : w.state === "error" ? "err" : "done"}` }),
-          paused ? "Paused" : w.state === "rendering" ? "Rendering" : w.state === "error" ? "Something went wrong" : "Idle — nothing left to render"),
+          paused ? "Paused" : w.state === "rendering" ? "Rendering" : w.state === "error" ? "Something went wrong"
+            : off ? `Idle · ${off} book${off > 1 ? "s" : ""} switched off` : "Idle — nothing left to render"),
           job && !paused ? h("div", { class: "muted small" }, `${job.title} · ${chapterLabel(job.chapter_title, cur?.lang)}, part ${job.segment + 1} of ${job.of}`) : null,
-          ...(!paused ? (w.lanes || []).map((l) => h("div", { class: "muted small" }, `Also: ${l.title} · ${chapterLabel(l.chapter_title, s.queue.find((q) => q.id === l.book)?.lang)}, part ${l.segment + 1} of ${l.of}`)) : []),
+          ...(!paused ? (w.lanes || []).map((l) => h("div", { class: "muted small" }, `Also: ${l.title} · ${chapterLabel(l.chapter_title, s.queue.find((q) => q.id === l.book)?.lang)}, part ${l.segment + 1} of ${l.of}` + (l.held ? " · holding while the part you're listening to renders" : ""))) : []),
           w.state === "error" ? h("div", { class: "muted small" }, w.error || "") : null),
         h("button", { class: "btn sm" + (paused ? "" : " ghost"), onclick: async () => { await api("/api/system", { method: "PUT", body: JSON.stringify({ paused: !paused }) }); paint(); } }, paused ? "Resume" : "Pause all")),
       cur ? h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(cur.ready, cur.total)}%` })) : null,
+      // speed is per lane (one chapter's chain); the time is for the whole book, with every lane on it
       h("div", { class: "stats" },
-        h("div", {}, h("b", {}, w.rate ? `${w.rate.toFixed(1)}×` : "—"), h("span", {}, "speed")),
-        h("div", {}, h("b", {}, cur ? `${pct(cur.ready, cur.total)}%` : "—"), h("span", {}, "book ready")),
-        h("div", {}, h("b", {}, cur && cur.eta != null ? short(cur.eta) : "—"), h("span", {}, "left"))),
+        h("div", {}, h("b", {}, w.rate ? `${w.rate.toFixed(1)}×` : "—"), h("span", {}, lanes > 1 ? `per lane · ${lanes} lanes` : "speed")),
+        h("div", {}, h("b", {}, cur ? `${pct(cur.ready, cur.total)}%` : "—"), h("span", {}, "of this book")),
+        h("div", {}, h("b", {}, cur && cur.eta != null ? short(cur.eta) : "—"), h("span", {}, "to finish it"))),
       h("div", { class: "row-between stack top-gap" }, h("div", {}, h("div", { class: "label" }, "CPU for rendering"), h("div", { class: "muted small" }, "More is faster, but the laptop gets busier and warmer")),
         seg([[2, "Low"], [4, "Medium"], [8, "High"]], s.settings.threads, async (v) => { await api("/api/system", { method: "PUT", body: JSON.stringify({ threads: v }) }); paint(); })));
     if (s.machine) fill(machineBox, ...machineRows(s.machine, w.state === "rendering" && !paused));
     fill(queueBox, ...(s.queue.length ? s.queue.map((q) => h("div", { class: "row-between" },
       h("a", { class: "grow", href: `#/book/${q.id}` }, h("div", { class: "label" }, q.title),
-        h("div", { class: "muted small" }, q.ready >= q.total - 1 ? `Fully rendered · ${human(q.total)}` : `${human(q.ready)} of ${human(q.total)} ready` + (q.render && q.eta != null ? ` · ${eta(q.eta)} to go` : q.render ? "" : " · off")),
+        h("div", { class: "muted small" }, q.state === "done" ? `Fully rendered · ${human(q.total)}`
+          : `${{ rendering: "Rendering now", queued: "Queued", paused: "Paused", off: "Off" }[q.state] || ""} · ${human(q.ready)} of ${human(q.total)}` + (q.render && q.eta != null && q.state !== "paused" ? ` · ${eta(q.eta)} to go` : "")),
         h("div", { class: "bar" }, h("i", { class: "ready", style: `width:${pct(q.ready, q.total)}%` }))),
       q.ready >= q.total - 1 ? null : switchEl(q.render, async (on) => { await api(`/api/books/${q.id}`, { method: "PATCH", body: JSON.stringify({ render: on }) }); paint(); }, "Render this book")))
       : [h("div", { class: "muted" }, "No books yet.")]));
@@ -637,6 +654,7 @@ const player = {
     this.wake(false);
     removeEventListener("scroll", this.onScroll);
     cancelAnimationFrame(this.raf);
+    this.raf = 0;
     this.root = null;
   },
 
@@ -751,9 +769,11 @@ const player = {
   layout() {         // the current chapter's timing changed: unit times, and on the reader its word spans and scrubber
     const e = this.chs.get(this.ch.index);
     this.ut = e?.units || [];
+    this.byI = new Map(this.ut.map((u) => [u.i, u]));
     if (!this.root) return;
-    for (const u of this.ut) this.wordify(u);
+    this.wordifyNear(this.cur);
     this.paintScrub();
+    this.loop();        // paused: one frame, for the new times
   },
   nextChapter(n) {
     const chs = this.book.chapters.filter((c) => c.include && c.n_units);
@@ -919,6 +939,7 @@ const player = {
     const gen = ++tp.gen;
     tp.ctl?.abort();
     tp.anchors = [];                 // until the new audio is in, the UI shows the target (startT)
+    if (this.root) this.loop();
     return this.exclusive(async () => {
       if (gen !== tp.gen) return "stale";
       const e = await this.entry(n, true);
@@ -1081,7 +1102,7 @@ const player = {
     const page = h("article", { class: "page", lang: b.lang, "data-hl": prefs.highlight });
     const byBlock = new Map();
     ch.units.forEach((u) => { if (!byBlock.has(u.block)) byBlock.set(u.block, []); byBlock.get(u.block).push(u); });
-    this.unitEls = [];
+    this.unitEls = []; this.wordEls = [];
     ch.blocks.forEach((blk, bi) => {
       let el;
       if (blk.kind === "scene_break") { page.append(h("hr")); return; }
@@ -1177,6 +1198,12 @@ const player = {
     setTimeout(() => addEventListener("click", () => s.remove(), { once: true }), 0);
   },
 
+  // word spans only around the narration (a long chapter has thousands of words): the sentence being read, two
+  // before it (stepping back lands in their clauses) and the next dozen; more are made as playback moves on
+  wordifyNear(i) {
+    if (!this.root || !this.byI) return;
+    for (let j = Math.max(0, i - 2); j <= i + 12; j++) { const u = this.byI.get(j); if (u) this.wordify(u); }
+  },
   wordify(u) {
     const span = this.unitEls[u.i];
     if (!span || span.dataset.w) return;
@@ -1190,7 +1217,7 @@ const player = {
     // a long sentence is split into clauses (at , ; : dashes and brackets, at least 4 words each): the highlight and
     // sentence steps (AirPods, arrow keys) then move by clause instead of by a whole screen of text
     const long = meta.end - meta.start > 260 && u.words.length > 30;
-    const starts = [], els = [];
+    const starts = [], els = [], ws = [];
     const clause = (k) => { target = h("span", { class: "c" }); span.append(target); starts.push(k); els.push(target); since = 0; };
     if (long) { span.classList.add("long"); clause(0); }
     u.words.forEach(([s, e], k) => {
@@ -1199,11 +1226,14 @@ const player = {
         if (long && k > 0 && since >= 4 && /[,;:—–()]/.test(gap)) { put(gap.replace(/\s+$/, "")); span.append(gap.match(/\s*$/)[0]); clause(k); }
         else put(gap);
       }
-      target.append(h("span", { class: "w", "data-k": k }, text.slice(s, e)));
+      const w = h("span", { class: "w" }, text.slice(s, e));
+      ws.push(w);
+      target.append(w);
       since++;
       pos = e;
     });
     if (pos < meta.end) put(text.slice(pos, meta.end));
+    this.wordEls[u.i] = ws;
     if (long) this.clauses.set(u.i, { starts, els });
   },
 
@@ -1215,6 +1245,7 @@ const player = {
     if (this.book) store.set(`speed:${this.book.id}`, v);
     if (this.$?.speed) this.$.speed.textContent = `${v}×`;
     this.positionState();
+    if (this.root) this.loop();      // times are shown at this speed
   },
   playUnit(i) { return this.seek(this.timeOfUnit(i), true, i); },
   play() {
@@ -1452,6 +1483,7 @@ const player = {
     this.unitEls[this.cur]?.classList.remove("cur");
     this.curWord?.classList.remove("cur"); this.curWord = null;
     this.cur = i;
+    this.wordifyNear(i);
     this.unitEls[i]?.classList.add("cur");
     if (this.follow || jump) this.scrollToCur(jump);
   },
@@ -1461,11 +1493,15 @@ const player = {
     const r = el.getBoundingClientRect(), vh = innerHeight;
     if (force || r.top < vh * 0.18 || r.bottom > vh * 0.62) el.scrollIntoView({ behavior: force ? "auto" : "smooth", block: el.offsetHeight > vh * 0.5 ? "start" : "center" });
   },
+  // the highlight and the times follow the audio every frame while it plays; paused, nothing moves, so it paints
+  // once (after a seek, a speed change, new timings) and stops asking for frames (battery)
   loop() {
+    if (this.raf) return;
     const tick = () => {
+      this.raf = 0;
       if (!this.root) return;
-      this.raf = requestAnimationFrame(tick);
       this.update();
+      if (!audio.paused) this.raf = requestAnimationFrame(tick);
     };
     tick();
   },
@@ -1485,8 +1521,7 @@ const player = {
         const words = u.words || [];
         let k = -1;
         for (let j = 0; j < words.length; j++) { if (words[j][2] <= t + 0.03) k = j; else break; }
-        const el = this.unitEls[u.i];
-        const w = k >= 0 && t <= words[k][3] + 0.25 ? el?.querySelectorAll(".w")[k] : null;
+        const w = k >= 0 && t <= words[k][3] + 0.25 ? this.wordEls[u.i]?.[k] : null;
         if (w !== this.curWord) { this.curWord?.classList.remove("cur"); w?.classList.add("cur"); this.curWord = w; }
         const cl = this.clauses.get(u.i);
         const c = cl ? cl.els[Math.max(0, cl.starts.findLastIndex((s) => s <= Math.max(k, 0)))] : null;
@@ -1573,8 +1608,8 @@ audio.addEventListener("ended", () => player.tape && player.onEnded());
 audio.addEventListener("error", () => player.onMediaError());
 audio.addEventListener("waiting", () => player.tape && player.onStall());
 audio.addEventListener("timeupdate", () => { player.pump(); if (document.hidden) player.update(); });
-audio.addEventListener("playing", () => { clearTimeout(player.stallTimer); clearInterval(player.etaTimer); player.retry = 0; player.setState("playing"); player.positionState(); });
-audio.addEventListener("seeked", () => player.positionState());
+audio.addEventListener("playing", () => { clearTimeout(player.stallTimer); clearInterval(player.etaTimer); player.retry = 0; player.setState("playing"); player.positionState(); player.loop(); });
+audio.addEventListener("seeked", () => { player.positionState(); player.loop(); });
 audio.addEventListener("pause", () => {
   player.wake(false);
   // we paused to wait (holding, or already "waiting": the event arrives after the flag is gone): the state says why

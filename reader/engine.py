@@ -1,8 +1,8 @@
-"""TTS engines. Text arrives fully normalized; a voice name picks its engine.
+"""The TTS engine: Pocket TTS (Kyutai, 100M). Text arrives fully normalized.
 
-- Pocket TTS (Kyutai, 100M): the default since the blind intonation reels of 2026-11-27 (caro_davy for English,
-  lola for Spanish). Its built-in voices include LibriVox narrators, prompts that read like a book rather than an ad.
-- Phonon (Gradium, 31M/40M): the first engine. Its catalog voices are assistant and ad reads. Kept as an option.
+Picked in the blind intonation reels of 2026-11-27 (caro_davy for English, lola for Spanish) over Phonon, Kokoro and
+ZONOS3: its built-in voices include LibriVox narrators, prompts that read like a book rather than an ad. Phonon, the
+first engine, was removed on 2026-11-27 (no book used it any more).
 """
 from __future__ import annotations
 
@@ -25,38 +25,17 @@ POCKET_VOICES = {
            "alba", "anna", "vera", "charles", "paul"],
     "es": ["lola"],
 }
-
-PHONON_VERSION = "phonon-2"   # bump to invalidate cached Phonon takes
-PHONON_MODELS = {"en": "hf://gradium/phonon-31m-en", "es": "hf://gradium/phonon-40m-es"}
-# Native narration pace (Phonon's duration_delta conditioner). 0 = model default (~209 wpm es / ~236 wpm en);
-# 1.0 measured ~177 / ~195 wpm with unchanged alignment scores and pitch variation. Saturates around 2.0.
-PACE = {"es": 1.0, "en": 1.0}
-PHONON_VOICES = {
-    "es": ["Alba", "Noa", "Candela", "Celia", "Alicia", "Nerea", "Lucía-Sol", "Marcos", "Borja", "Iker", "Nuno", "Izan",
-           "Guillermo", "Rebeca", "Regina", "Danae", "Azucena", "Jimena", "Ximena", "Lalo", "Aldo", "Yael", "Ulises", "Leonel", "Nico"],
-    "en": ["Easton", "Micah", "Trevor", "Russell", "Preston", "Miles", "Zoey", "Juniper", "Everly", "Harper", "Hadley", "Delia",
-           "Maeve", "Freya", "Pippa", "Elodie-Rose", "Imogen", "Lottie", "Bryony", "Alfie", "Hugh", "Edwin", "Spencer", "Toby", "Teddy"],
-}
+# Pace: Pocket has no speed control. Measured 2026-11-27: ~203 wpm inside sentences, ~176 wpm with the pauses
+# (audiobooks are usually 150-160). Slower listening is the player's speed setting (pitch preserved).
 
 DEFAULT_VOICE = {"en": "caro_davy", "es": "lola"}
-VOICES = {lang: POCKET_VOICES[lang] + PHONON_VOICES[lang] for lang in ("en", "es")}
+VOICES = POCKET_VOICES
 
 
-def engine_of(lang: str, voice: str) -> str:
-    return "pocket" if voice in POCKET_VOICES.get(lang, []) else "phonon"
-
-
-def _threads() -> int:
-    return int(os.environ.get("READER_THREADS", "4"))
-
-
-@functools.lru_cache(maxsize=4)
-def _phonon(lang: str, quant: str):
-    import ptts
-    ptts.set_num_threads(_threads())
-    tts = ptts.TTS(PHONON_MODELS[lang], lang=lang, quant=quant, rewrites="none")
-    tts.set_conditions({"duration_delta": PACE.get(lang, 0.0)})
-    return tts
+def voice_for(lang: str, voice: str | None) -> str:
+    """The book's voice if Pocket has it in that language, else the language's narrator (e.g. a book that was on a
+    Phonon voice before Phonon was removed)."""
+    return voice if voice in POCKET_VOICES.get(lang, []) else DEFAULT_VOICE[lang]
 
 
 def quiet_logs() -> None:
@@ -70,7 +49,7 @@ def release() -> None:
     import ctypes
     import gc
     drop_pool()
-    for f in (_pocket_model, _pocket_voice, _pocket_ref, _phonon):
+    for f in (_pocket_model, _pocket_voice, _pocket_ref):
         f.cache_clear()
     from . import align
     align._model.cache_clear()
@@ -140,14 +119,13 @@ def context_state(lang: str, voice: str, prev: np.ndarray):
 
 
 class Engine:
-    def __init__(self, lang: str, voice: str | None = None, quant: str = "f32"):
-        self.lang, self.voice, self.quant = lang, voice or DEFAULT_VOICE[lang], quant
-        self.kind = engine_of(lang, self.voice)
+    def __init__(self, lang: str, voice: str | None = None):
+        self.lang, self.voice = lang, voice_for(lang, voice)
         self.can_synth = True      # models load on first use: the renderer's main process mostly only verifies
 
     @property
     def tts(self):
-        return _pocket_model(self.lang) if self.kind == "pocket" else _phonon(self.lang, self.quant)
+        return _pocket_model(self.lang)
 
     @property
     def state(self):
@@ -155,35 +133,30 @@ class Engine:
 
     @property
     def key(self) -> str:
-        return self.key_for(self.lang, self.voice, self.quant)
+        return self.key_for(self.lang, self.voice)
 
     @staticmethod
-    def key_for(lang: str, voice: str | None = None, quant: str = "f32") -> str:
-        voice = voice or DEFAULT_VOICE[lang]
-        if engine_of(lang, voice) == "pocket":
-            return f"{POCKET_VERSION}:{lang}:{POCKET_MODEL[lang]}:{voice}"
-        return f"{PHONON_VERSION}:{lang}:{voice}:{quant}:pace{PACE.get(lang, 0.0)}"
+    def key_for(lang: str, voice: str | None = None) -> str:
+        return f"{POCKET_VERSION}:{lang}:{POCKET_MODEL[lang]}:{voice_for(lang, voice)}"
 
     @property
     def uses_context(self) -> bool:
-        return self.kind == "pocket" and CONTEXT
+        return CONTEXT
 
-    def synth(self, text: str, seed: int, temperature: float = 0.3, context: np.ndarray | None = None) -> np.ndarray:
-        """`context`: the previous sentence's audio (Pocket only): it goes into the voice prompt."""
-        if self.kind == "pocket":
-            import torch
-            state = context_state(self.lang, self.voice, context) if context is not None and self.uses_context else self.state
-            torch.manual_seed(seed)        # a take = a seed (Pocket's temperature is fixed when the model loads)
-            n = torch.get_num_threads()
-            torch.set_num_threads(1)       # Pocket runs best on one core; encoding and verification use more
-            try:
-                return self.tts.generate_audio(state, text).numpy().reshape(-1).astype(np.float32)
-            finally:
-                torch.set_num_threads(n)
-        return np.asarray(self.tts.synth(text, voice=self.voice, seed=seed, temperature=temperature), dtype=np.float32)
+    def synth(self, text: str, seed: int, context: np.ndarray | None = None) -> np.ndarray:
+        """`context`: the previous sentence's audio: it goes into the voice prompt."""
+        import torch
+        state = context_state(self.lang, self.voice, context) if context is not None and self.uses_context else self.state
+        torch.manual_seed(seed)        # a take = a seed (Pocket's temperature is fixed when the model loads)
+        n = torch.get_num_threads()
+        torch.set_num_threads(1)       # Pocket runs best on one core; encoding and verification use more
+        try:
+            return self.tts.generate_audio(state, text).numpy().reshape(-1).astype(np.float32)
+        finally:
+            torch.set_num_threads(n)
 
 
-# ---------------------------------------------------------------- parallel synthesis (Pocket)
+# ---------------------------------------------------------------- parallel synthesis
 # Pocket speaks on one core, so the renderer keeps a few worker processes that synthesize upcoming sentences'
 # first takes while the main process verifies and assembles. Each process loads its own model (they aren't
 # thread-safe) and keeps it for the voices it has seen.

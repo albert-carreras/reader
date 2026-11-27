@@ -307,7 +307,8 @@ const renderChip = () => {
         txt.textContent = st.book ? `Rendering · ${pct(st.book.ready, st.book.total)}%` : "Rendering";
       } else if (w.state === "paused") { ico.innerHTML = ICON2.pause; txt.textContent = "Paused"; }
       else if (w.state === "error") { ico.innerHTML = ICON2.warn; txt.textContent = "Needs attention"; }
-      else if (st.books?.queued) { chip.dataset.state = "queued"; ico.innerHTML = ICON2.pause; txt.textContent = "Queued"; }      // e.g. books being upgraded
+      else if (st.books?.upgrading) { chip.dataset.state = "queued"; ico.innerHTML = ICON2.pause; txt.textContent = "Getting books ready"; }
+      else if (st.books?.queued) { chip.dataset.state = "queued"; ico.innerHTML = ICON2.pause; txt.textContent = "Queued"; }
       else if (st.books?.off) { chip.dataset.state = "off"; ico.innerHTML = ICON2.pause; txt.textContent = `${st.books.off} book${st.books.off > 1 ? "s" : ""} off`; }
       else { ico.innerHTML = ICON2.check; txt.textContent = "All rendered"; }
     } catch { chip.dataset.state = "offline"; chip.querySelector(".chip-txt").textContent = "Offline"; }
@@ -407,20 +408,24 @@ async function viewBook(id) {
   const p = b.progress;
   const done = p.ready_est >= p.total_est - 1;
   const top = topbar(back("#/", "Library"), null, renderChip(), gear());
-  const miniIsThis = (player.tape && player.book ? player.book.id : store.get("recent", null)?.id) === id;
+  const live = player.tape && player.book;
+  // the bar resumes this book from its newest place (this phone's or the server's), not from an older chapter
+  if (!live && pos && cur && store.get("recent", null)?.id === id) player.remember(b, cur.index, cur.title);
+  const miniIsThis = (live ? player.book.id : store.get("recent", null)?.id) === id;
 
   // complete · rendering · queued (another book first) · paused (all rendering) · off (this book only)
   const st = done ? "done" : b.state || (!b.render ? "off" : b.rendering_now ? "rendering" : "queued");
   const where = (b.rendering_at || []).map((n) => b.chapters.find((c) => c.index === n)).filter(Boolean).map((c) => chapterLabel(c.title, b.lang));
   const state = { done: ["done", "Fully rendered"], off: ["off", "Off for this book"], paused: ["off", "Paused · all rendering is paused"],
-    rendering: ["on", "Rendering now" + (where.length ? ` · ${where.join(", ")}` : "")], queued: ["queued", "Queued · another book renders first"] }[st] || ["queued", "Queued"];
+    rendering: ["on", "Rendering now" + (where.length ? ` · ${where.join(", ")}` : "")], queued: ["queued", "Queued · another book renders first"],
+    upgrading: ["queued", "Getting ready · re-reading the book for the new narration"] }[st] || ["queued", "Queued"];
   const toggleRender = async () => { await api(`/api/books/${id}`, { method: "PATCH", body: JSON.stringify({ render: !b.render }) }); viewBook(id); };
   const resumeAll = async () => { await api("/api/system", { method: "PUT", body: JSON.stringify({ paused: false }) }); viewBook(id); };
   const legend = (cls, text) => h("span", { class: "key" }, h("i", { class: `sw ${cls}` }), text);
   const renderCard = h("section", { class: "card-box" },
     h("div", { class: "row-between" },
       h("div", {}, h("div", { class: "label" }, h("span", { class: `dot ${state[0]}` }), state[1]),
-        h("div", { class: "muted small" }, `${human(p.ready_est)} of ${human(p.total_est)} rendered` + (b.render && !done && b.eta ? ` · about ${eta(b.eta)} to go` : ""))),
+        h("div", { class: "muted small" }, `${human(p.ready_est)} of ${human(p.total_est)} rendered` + (b.render && !done && b.eta && st !== "paused" ? ` · about ${eta(b.eta)} to go` : ""))),
       done ? null : st === "paused" ? h("button", { class: "btn sm", onclick: resumeAll }, "Resume")
         : h("button", { class: "btn ghost sm", onclick: toggleRender }, b.render ? "Turn off" : "Turn on")),
     h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(p.ready_est, p.total_est)}%` }), h("i", { style: `width:${pct(p.heard_est, p.total_est)}%` })),
@@ -527,7 +532,7 @@ async function viewSystem() {
     fill(queueBox, ...(s.queue.length ? s.queue.map((q) => h("div", { class: "row-between" },
       h("a", { class: "grow", href: `#/book/${q.id}` }, h("div", { class: "label" }, q.title),
         h("div", { class: "muted small" }, q.state === "done" ? `Fully rendered · ${human(q.total)}`
-          : `${{ rendering: "Rendering now", queued: "Queued", paused: "Paused", off: "Off" }[q.state] || ""} · ${human(q.ready)} of ${human(q.total)}` + (q.render && q.eta != null && q.state !== "paused" ? ` · ${eta(q.eta)} to go` : "")),
+          : `${{ rendering: "Rendering now", queued: "Queued", paused: "Paused", off: "Off", upgrading: "Getting ready" }[q.state] || ""} · ${human(q.ready)} of ${human(q.total)}` + (q.render && q.eta != null && q.state !== "paused" ? ` · ${eta(q.eta)} to go` : "")),
         h("div", { class: "bar" }, h("i", { class: "ready", style: `width:${pct(q.ready, q.total)}%` }))),
       q.ready >= q.total - 1 ? null : switchEl(q.render, async (on) => { await api(`/api/books/${q.id}`, { method: "PATCH", body: JSON.stringify({ render: on }) }); paint(); }, "Render this book")))
       : [h("div", { class: "muted" }, "No books yet.")]));
@@ -1495,13 +1500,16 @@ const player = {
   },
   // the highlight and the times follow the audio every frame while it plays; paused, nothing moves, so it paints
   // once (after a seek, a speed change, new timings) and stops asking for frames (battery)
+  // (a call from inside a frame, e.g. layout() when the playhead enters the next chapter, must not start a second
+  // chain of frames: `ticking` turns it away, and only one frame is ever pending)
   loop() {
-    if (this.raf) return;
+    if (this.raf || this.ticking) return;
     const tick = () => {
       this.raf = 0;
       if (!this.root) return;
-      this.update();
-      if (!audio.paused) this.raf = requestAnimationFrame(tick);
+      this.ticking = true;
+      try { this.update(); } finally { this.ticking = false; }
+      if (!audio.paused && !this.raf && this.root) this.raf = requestAnimationFrame(tick);
     };
     tick();
   },

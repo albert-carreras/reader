@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import os
+import threading
 
 import numpy as np
 
@@ -118,6 +119,11 @@ def context_state(lang: str, voice: str, prev: np.ndarray):
     return state
 
 
+# A Pocket model isn't thread-safe, and torch's thread count is process-wide: synthesis in one process goes one at a
+# time (render lanes are threads of the app's process; the worker processes each run one sentence anyway).
+_synth_lock = threading.Lock()
+
+
 class Engine:
     def __init__(self, lang: str, voice: str | None = None):
         self.lang, self.voice = lang, voice_for(lang, voice)
@@ -146,14 +152,15 @@ class Engine:
     def synth(self, text: str, seed: int, context: np.ndarray | None = None) -> np.ndarray:
         """`context`: the previous sentence's audio: it goes into the voice prompt."""
         import torch
-        state = context_state(self.lang, self.voice, context) if context is not None and self.uses_context else self.state
-        torch.manual_seed(seed)        # a take = a seed (Pocket's temperature is fixed when the model loads)
-        n = torch.get_num_threads()
-        torch.set_num_threads(1)       # Pocket runs best on one core; encoding and verification use more
-        try:
-            return self.tts.generate_audio(state, text).numpy().reshape(-1).astype(np.float32)
-        finally:
-            torch.set_num_threads(n)
+        with _synth_lock:
+            state = context_state(self.lang, self.voice, context) if context is not None and self.uses_context else self.state
+            torch.manual_seed(seed)        # a take = a seed (Pocket's temperature is fixed when the model loads)
+            n = torch.get_num_threads()
+            torch.set_num_threads(1)       # Pocket runs best on one core; encoding and verification use more
+            try:
+                return self.tts.generate_audio(state, text).numpy().reshape(-1).astype(np.float32)
+            finally:
+                torch.set_num_threads(n)
 
 
 # ---------------------------------------------------------------- parallel synthesis

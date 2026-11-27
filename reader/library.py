@@ -137,6 +137,12 @@ def upgrade_all(after_each=None) -> None:
     """Re-segment books made by an older pipeline. Their audio is rebuilt by the renderer, from cached takes when the
     spoken text is unchanged (~14x realtime). The listener's place is carried over by its position in the text, since
     unit numbers change with segmentation. Runs in the background at startup."""
+    from .engine import voice_for
+    for mp in sorted(BOOKS.glob("*/meta.json")):     # a voice the engine no longer has (Phonon's): the narrator,
+        m = _read(mp)                                 # with the old audio dropped so voices never mix in a chapter
+        if m and voice_for(m["lang"], m["voice"]) != m["voice"]:
+            log.info("%s: voice %s is gone, now %s", m["id"], m["voice"], voice_for(m["lang"], m["voice"]))
+            set_voice(m["id"], voice_for(m["lang"], m["voice"]))
     for mp in sorted(BOOKS.glob("*/meta.json")):
         m = _read(mp)
         if not m or m.get("pipeline", 1) >= PIPELINE:

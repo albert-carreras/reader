@@ -39,6 +39,16 @@ def wrong_ending(kind: str, f: dict | None) -> bool:
     return bool(rule and f and rule[0](f["final_delta"]))
 
 
+def rank(u: Unit, t: dict) -> tuple:
+    """Order of preference among takes (lowest first): a right ending that keeps the voice's register and pace, then
+    the others, then takes with no measurable pitch (nothing to judge, and the pitch fix can't run on them); the
+    score decides within each group."""
+    if t["f"] is None:
+        return 2, -t["score"]
+    steady = t["parts"].get("register", 0) > -0.5 and t["parts"].get("pace", 0) > -0.5
+    return (0 if steady and not wrong_ending(u.kind, t["f"]) else 1), -t["score"]
+
+
 @dataclass
 class VoiceStats:
     """Running picture of the voice, so takes stay consistent from sentence to sentence."""
@@ -138,17 +148,19 @@ def final_audio(meta: dict, cache: Path) -> np.ndarray:
     return audio
 
 
-def render_unit(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, first=None, ctx=None, on_first=None) -> dict:
+def render_unit(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, first=None, ctx=None, on_first=None,
+                submit=None) -> dict:
     """`first`: a future holding take 0's raw audio, already being synthesized in a worker process.
     `ctx`: (ctx_id, audio) of the sentence before, for engines that use context.
     `on_first(audio)`: called with take 0 as soon as it exists (unless a second take follows), so the next sentence
-    can start meanwhile."""
+    can start meanwhile.
+    `submit(text, seed, context)`: a future for any further take, from the worker processes (None: synthesize here)."""
     ctx_key, ctx_audio = ctx if ctx is not None and getattr(eng, "uses_context", False) else ("", None)
     key = unit_key(u, eng, ctx_key)
     wav_p, meta_p = cache / f"{key}.wav", cache / f"{key}.json"
     if wav_p.exists() and meta_p.exists():
         meta = json.loads(meta_p.read_text())
-        meta = _refresh_cached(u, eng, stats, cache, meta, meta_p)
+        meta = _refresh_cached(u, eng, stats, cache, meta, meta_p, ctx_audio, submit)
         _maybe_reshape(meta, cache, meta_p)
         _learn(stats, meta)
         return meta
@@ -161,16 +173,14 @@ def render_unit(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, first=None
             audio = None
     takes = [_take(u, eng, stats, 0, audio, ctx_audio)]
     if SECOND_TAKE and wrong_ending(u.kind, takes[0]["f"]):
-        takes.append(_take(u, eng, stats, 1, None, ctx_audio))      # the next sentence waits to hear the winner
+        takes.append(_take(u, eng, stats, 1, None, ctx_audio, submit))      # the next sentence waits to hear the winner
     elif on_first is not None:
         on_first(takes[0]["audio"])
     synth_s = time.time() - t0
     flags = []
-    # a right ending first (that's what a second take is for), then the score; the first of those that verifies
-    ranked = sorted(takes, key=lambda t: (wrong_ending(u.kind, t["f"]), -t["score"]))
-    chosen = next((t for t in ranked if _verified(t, u.spoken, flags)), None)
+    chosen = next((t for t in sorted(takes, key=lambda t: rank(u, t)) if _verified(t, u.spoken, flags)), None)
     if chosen is None:
-        chosen = _retry(u, eng, stats, takes, flags, ctx_audio)
+        chosen = _retry(u, eng, stats, takes, flags, ctx_audio, submit)
     sf.write(wav_p, chosen["audio"], SR, subtype="PCM_16")
     meta = _meta(u, key, chosen, takes, flags, t0, synth_s)
     meta_p.write_text(json.dumps(meta, ensure_ascii=False))
@@ -180,7 +190,13 @@ def render_unit(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, first=None
 
 
 def _take(u: Unit, eng: Engine, stats: VoiceStats, k: int, raw: np.ndarray | None = None,
-          context: np.ndarray | None = None) -> dict:
+          context: np.ndarray | None = None, submit=None) -> dict:
+    if raw is None and submit is not None:          # in a worker process: the model there, not in the app's process
+        fut = submit(u.spoken, _seed(u.spoken, k), context)
+        try:
+            raw = fut.result() if fut is not None else None
+        except Exception:  # noqa: BLE001  (a broken worker: synthesize here instead)
+            raw = None
     if raw is None:
         raw = eng.synth(u.spoken, seed=_seed(u.spoken, k), context=context)
     audio, _ = squash_silence(trim(raw))
@@ -204,16 +220,17 @@ def _verified(t: dict, spoken: str, flags: list) -> bool:
     return ok
 
 
-def _retry(u: Unit, eng: Engine, stats: VoiceStats, takes: list, flags: list, context: np.ndarray | None = None) -> dict:
+def _retry(u: Unit, eng: Engine, stats: VoiceStats, takes: list, flags: list, context: np.ndarray | None = None,
+           submit=None) -> dict:
     """No take passed verification: one more seed before settling (Pocket's failures are mostly the checker's). If it
-    fails too, the best-scoring take is kept and flagged UNVERIFIED (listed by `reader qa`)."""
-    t = _take(u, eng, stats, max(t["k"] for t in takes) + 1, None, context)
+    fails too, the preferred take (see rank) is kept and flagged UNVERIFIED (listed by `reader qa`)."""
+    t = _take(u, eng, stats, max(t["k"] for t in takes) + 1, None, context, submit)
     takes.append(t)
     if _verified(t, u.spoken, flags):
         flags.append("retried")
         return t
     flags.append("UNVERIFIED")
-    return max(takes, key=lambda t: t["score"])
+    return min(takes, key=lambda t: rank(u, t))
 
 
 def _meta(u: Unit, key: str, chosen: dict, takes: list, flags: list, t0: float, synth_s: float) -> dict:
@@ -224,9 +241,10 @@ def _meta(u: Unit, key: str, chosen: dict, takes: list, flags: list, t0: float, 
                 secs=round(time.time() - t0, 2), synth_secs=round(synth_s, 2), squashed=True, retried=True)
 
 
-def _refresh_cached(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, meta: dict, meta_p: Path) -> dict:
+def _refresh_cached(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, meta: dict, meta_p: Path,
+                    context: np.ndarray | None = None, submit=None) -> dict:
     """Bring a take cached by an older renderer up to date: squash its dead air (word timings move with it), and
-    give unverified takes the extra seeds they never got."""
+    give unverified takes the extra seeds they never got (hearing the same sentence before as the original did)."""
     wav_p = cache / f"{meta['key']}.wav"
     if not meta.get("squashed"):
         audio, _ = sf.read(wav_p, dtype="float32")
@@ -251,7 +269,7 @@ def _refresh_cached(u: Unit, eng: Engine, stats: VoiceStats, cache: Path, meta: 
         old = dict(k=meta["n_takes"] - 1, audio=audio, f=prosody.features(audio), score=meta["score"], parts=meta.get("parts", {}),
                    ali=meta["words"])            # k: new seeds start after the ones already tried
         takes, flags, t0 = [old], [f for f in meta["flags"] if f != "UNVERIFIED"], time.time()
-        chosen = _retry(u, eng, stats, takes, flags)
+        chosen = _retry(u, eng, stats, takes, flags, context, submit)
         if flags[-1] != "UNVERIFIED":                # a new seed passed: it replaces the old take
             sf.write(wav_p, chosen["audio"], SR, subtype="PCM_16")
             for var in cache.glob(f"{meta['key']}.*.wav"):

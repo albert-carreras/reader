@@ -137,7 +137,7 @@ def status():
     job = worker.status.get("job")
     if job:
         st["book"] = next((b for b in q if b["id"] == job["book"]), None)
-    st["books"] = {k: sum(b["state"] == k for b in q) for k in ("done", "off", "rendering", "queued", "paused")}
+    st["books"] = {k: sum(b["state"] == k for b in q) for k in ("done", "off", "upgrading", "rendering", "queued", "paused")}
     return st
 
 
@@ -229,9 +229,9 @@ def get_book(book_id: str):
     q = next((b for b in worker.queue() if b["id"] == book_id), None)
     m["eta"] = q and q["eta"]
     m["state"] = q and q["state"]                     # done · off · paused · rendering · queued
-    jobs = [j for j in [worker.status.get("job") or {}, *worker.lane_jobs.values()] if j.get("book") == book_id]
+    jobs = [j for j in worker.active_jobs() if j["book"] == book_id]
     m["rendering_now"] = bool(jobs)
-    m["rendering_at"] = sorted(j["chapter"] for j in jobs) or None   # which chapters, so "2% ready" has a where
+    m["rendering_at"] = sorted({j["chapter"] for j in jobs}) or None   # which chapters, so "2% ready" has a where
     return m
 
 

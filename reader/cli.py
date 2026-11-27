@@ -2,7 +2,7 @@
 
   reader chapters BOOK.epub                       list chapters
   reader script BOOK.epub -c 3                    show what will be spoken (no audio)
-  reader render BOOK.epub -c 3 [-n 40] [-v Noa]   render chapter 3 (optionally only its first n units)
+  reader render BOOK.epub -c 3 [-n 40] [-v lola]  render chapter 3 (optionally only its first n units)
   reader say "text" -l es                         render one line (debug)
   reader qa [BOOK]                                the rendered sentences most worth a listen, with timestamps
 """
@@ -46,6 +46,12 @@ def _fmt(s):
     return f"{m}m{s:02d}s"
 
 
+def _check_voice(lang: str, voice: str | None) -> None:
+    from .engine import POCKET_VOICES
+    if voice and voice not in POCKET_VOICES.get(lang, []):
+        sys.exit(f"no voice {voice!r} for {lang}: {', '.join(POCKET_VOICES.get(lang, []))}")
+
+
 def cmd_render(a):
     os.environ.setdefault("READER_THREADS", str(a.threads))
     import torch
@@ -60,6 +66,7 @@ def cmd_render(a):
     lang = a.lang or bk.lang
     ch = bk.chapters[a.chapter - 1]
     units = segment.units(ch, lang)[: a.n or None]
+    _check_voice(lang, a.voice)
     eng = Engine(lang, a.voice)
     slug = re.sub(r"\W+", "-", Path(a.epub).stem).strip("-")
     out = Path(a.out) / slug
@@ -102,6 +109,7 @@ def cmd_say(a):
     from . import prosody
     from .engine import SR, Engine, trim
     from .textnorm import speak
+    _check_voice(a.lang, a.voice)
     eng = Engine(a.lang, a.voice)
     spoken = speak(a.text, a.lang)
     audio = trim(eng.synth(spoken, seed=a.seed))

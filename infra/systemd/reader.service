@@ -19,11 +19,15 @@ RestartSec=5
 # rendering is background work: keep the laptop responsive
 Nice=5
 CPUWeight=50
-# never take the machine down (2026-11-27 it ran out of memory and froze): past 6 GB the kernel reclaims from this
-# service first; past 7 GB only this service is killed (and restarts). Almost no swap: thrashing is what froze it.
-MemoryHigh=6G
+# never take the machine down (2026-11-27 it ran out of memory and froze): past 7 GB only this service is killed
+# (and restarts in seconds). Almost no swap: thrashing is what froze it. No MemoryHigh: throttling this service
+# stalls the web server with it, and the app stops loading (also 2026-11-27); the renderer keeps well below the
+# limit by itself (render lanes only start with headroom under it).
 MemoryMax=7G
 MemorySwapMax=256M
+# when the limit is hit the kernel stops a voice process (they volunteer: oom_score_adj 1000); keep the service
+# running (systemd would otherwise stop all of it, and the app with it), the renderer replaces the process
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target

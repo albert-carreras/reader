@@ -293,12 +293,15 @@ svg.spin { animation: spin .9s linear infinite; }
 @keyframes pill-again { 0% { transform: scale(.94); } 60% { transform: scale(1.03); } 100% { transform: none; } }
 
 /* rendering page: the laptop's CPU and memory, the reader's share first */
+.card-box.rows > .mrow { padding: .85rem 0 .8rem; border-bottom: 1px solid var(--line); }
+.card-box.rows > .mrow:last-child { border-bottom: 0; }
 .mrow .num { font-variant-numeric: tabular-nums; font-weight: 650; }
-.meter { position: relative; display: flex; gap: 2px; height: 6px; margin: .5rem 0 .45rem; }
-.meter > i { flex: none; height: 100%; border-radius: 3px; }
+.meter { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--line); margin: .6rem 0 .5rem; }
+.meter > i { flex: none; height: 100%; box-sizing: border-box; }
+.meter > i + i { border-left: 2px solid var(--surface); }
 .meter > i.me, .sw.me { background: var(--accent); }
-.meter > i.other, .sw.other { background: color-mix(in srgb, var(--muted) 60%, transparent); }
-.meter > i.rest { flex: 1; min-width: 0; background: var(--line); }
-.meter > b.cap { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink); opacity: .6; }
-.key { display: inline-flex; align-items: center; gap: .35rem; margin-right: .9rem; white-space: nowrap; }
+.meter > i.other, .sw.other { background: color-mix(in srgb, var(--muted) 55%, var(--surface)); }
+.mrow .muted.small { display: flex; flex-wrap: wrap; column-gap: 1rem; row-gap: .2rem; }
+.key { display: inline-flex; align-items: center; gap: .4rem; white-space: nowrap; }
 .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; }
+.mrow .hot { color: var(--bad); }

@@ -484,7 +484,7 @@ async function viewSystem() {
   app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
   const statusBox = h("section", { class: "card-box" }), queueBox = h("section", { class: "card-box rows" }), storeBox = h("section", { class: "card-box rows" });
   const machineBox = h("section", { class: "card-box rows" });
-  main.append(statusBox, h("h2", { class: "section" }, "Laptop"), machineBox, h("h2", { class: "section" }, "Books"), queueBox, h("h2", { class: "section" }, "Storage"), storeBox);
+  main.append(statusBox, h("h2", { class: "section" }, "Rendering by book"), queueBox, h("h2", { class: "section" }, "Laptop"), machineBox, h("h2", { class: "section" }, "Storage"), storeBox);
 
   const paint = async () => {
     if (!main.isConnected) return clearInterval(sysTimer);
@@ -536,39 +536,32 @@ async function viewSystem() {
   paintStorage();
 }
 
-// what the laptop is doing: the reader's share of CPU and memory next to everything else's, swap, heat, power
+// what the laptop is doing: the reader's share of CPU and memory next to the other apps', heat, power
 function machineRows(m, rendering) {
-  const gb = (b) => b == null ? "—" : `${(b / 2 ** 30).toFixed(1)} GB`;     // GiB, like the limit in the service file
-  const meter = (parts, total, cap) => {    // parts: [[value, class]], drawn left to right; the rest is free
-    const el = h("div", { class: "meter" });
-    for (const [v, cls] of parts) if (v > 0) el.append(h("i", { class: cls, style: `width:${Math.min(100, 100 * v / total).toFixed(1)}%` }));
-    el.append(h("i", { class: "rest" }));
-    if (cap) el.append(h("b", { class: "cap", style: `left:${Math.min(100, 100 * cap / total).toFixed(1)}%`, title: "The reader's memory limit" }));
-    return el;
-  };
+  const gb = (b) => `${(b / 2 ** 30).toFixed(1)} GB`;     // GiB, like the limit in the service file
+  const meter = (mine, other, total) => h("div", { class: "meter" },
+    ...[[mine, "me"], [other, "other"]].filter(([v]) => v > 0).map(([v, cls]) => h("i", { class: cls, style: `width:${Math.min(100, 100 * v / total).toFixed(1)}%` })));
   const key = (cls, text) => h("span", { class: "key" }, h("i", { class: `sw ${cls}` }), text);
-  const block = (label, value, bar, ...notes) => h("div", { class: "mrow" },
-    h("div", { class: "row-between" }, h("div", { class: "label" }, label), h("div", { class: "num" }, value)), bar,
-    ...notes.filter(Boolean).map((n) => h("div", { class: "muted small" }, n)));
+  const row = (label, value, ...below) => h("div", { class: "mrow" },
+    h("div", { class: "row-between" }, h("div", { class: "label" }, label), h("div", { class: "num" }, value)), ...below);
   const rows = [];
   if (m.cpu != null) {
-    const mine = m.cpu_reader ?? 0, other = Math.max(0, m.cpu - mine);
-    const hot = m.temp != null && m.temp >= 85;
-    rows.push(block("CPU", `${Math.round(m.cpu)}%`, meter([[mine, "me"], [other, "other"]], 100),
-      h("span", {}, key("me", `Reader ${Math.round(mine)}%`), key("other", `Everything else ${Math.round(other)}%`)),
-      [`${m.cores} cores`, m.temp != null ? `${Math.round(m.temp)} °C${hot ? " · hot: Low rendering would cool it down" : ""}` : null].filter(Boolean).join(" · ")));
+    const mine = Math.min(m.cpu_reader ?? 0, m.cpu), other = m.cpu - mine;
+    rows.push(row("CPU", `${Math.round(m.cpu)}%`, meter(mine, other, 100),
+      h("div", { class: "muted small" }, key("me", `Reader ${Math.round(mine)}%`), key("other", `Other apps ${Math.round(other)}%`),
+        m.temp != null ? h("span", { class: m.temp >= 85 ? "hot" : "" }, `${Math.round(m.temp)} °C`) : null)));
   }
   if (m.mem_total) {
-    const used = m.mem_total - m.mem_available, mine = Math.min(m.mem_reader || 0, used), other = Math.max(0, used - mine);
-    const cap = m.mem_reader_max || m.mem_reader_high;
-    rows.push(block("Memory", `${gb(used)} of ${gb(m.mem_total)}`, meter([[mine, "me"], [other, "other"]], m.mem_total, cap),
-      h("span", {}, key("me", `Reader ${gb(mine)}${cap ? ` (limit ${gb(cap)})` : ""}`), key("other", `Everything else ${gb(other)}`)),
-      `${gb(m.mem_available)} free${m.swap_used > 2e8 ? ` · ${gb(m.swap_used)} of ${gb(m.swap_total)} swapped to disk` : ""}`));
+    const used = m.mem_total - m.mem_available, mine = Math.min(m.mem_reader || 0, used), other = used - mine;
+    const cap = m.mem_reader_max;
+    rows.push(row("Memory", `${gb(used)} of ${gb(m.mem_total)}`, meter(mine, other, m.mem_total),
+      h("div", { class: "muted small" }, key("me", `Reader ${gb(mine)}${cap ? ` · limit ${gb(cap)}` : ""}`), key("other", `Other apps ${gb(other)}`),
+        m.swap_used > 2 ** 30 ? h("span", {}, `${gb(m.swap_used)} swapped`) : null)));
   }
   if (m.power) {
     const p = m.power;
-    rows.push(h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Power"),
-      h("div", { class: "muted small" }, p.plugged ? `Plugged in · battery ${p.battery}%` : `On battery · ${p.battery}%${rendering ? " · rendering drains it faster" : ""}`))));
+    rows.push(h("div", { class: "row-between" }, h("div", { class: "label" }, "Power"),
+      h("div", { class: "muted small num-plain" }, p.plugged ? `Plugged in · ${p.battery}%` : `On battery · ${p.battery}%${rendering ? " · rendering drains it" : ""}`)));
   }
   return rows;
 }

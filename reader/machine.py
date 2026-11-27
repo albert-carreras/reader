@@ -79,6 +79,17 @@ def _power() -> dict | None:
     return None
 
 
+def headroom_gb() -> float:
+    """Memory this service can still take: what's left under its own limit, or the machine's available memory if
+    that is less."""
+    avail = _meminfo().get("MemAvailable", 0) / 2**30 or 99.0
+    cg = _cgroup()
+    cap, cur = _limit(cg, "memory.max"), _limit(cg, "memory.current")
+    if cap and cur is not None:
+        return min(avail, (cap - cur) / 2**30)
+    return avail
+
+
 def snapshot() -> dict:
     global _last
     now = _cpu_sample()

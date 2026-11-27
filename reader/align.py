@@ -12,16 +12,48 @@ SR = 16000
 PAD = 0.3
 
 
+def _full_precision():
+    """MMS_FA as torchaudio builds it, but reading the weights straight from its file on disk (memory-mapped)
+    instead of copying 1.2 GB into memory twice (checkpoint + model): quantizing then needs almost no extra memory.
+    Falls back to torchaudio's own loader (which also downloads the file the first time)."""
+    import os
+    from pathlib import Path
+    from urllib.parse import urlparse
+    import torch
+    from torchaudio.pipelines import MMS_FA as B
+    try:
+        from torchaudio.pipelines._wav2vec2 import utils
+        path = Path(torch.hub.get_dir()) / "checkpoints" / os.path.basename(urlparse(B._path).path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        sd = torch.load(path, mmap=True, weights_only=True)
+        if B._remove_aux_axis:
+            utils._remove_aux_axes(sd, B._remove_aux_axis)
+        with torch.device("meta"):                                   # no memory for weights about to be replaced
+            model = utils._get_model(B._model_type, B._params)
+        model.load_state_dict(sd, assign=True)
+        model = utils._extend_model(model, normalize_waveform=B._normalize_waveform, apply_log_softmax=True, append_star=False)
+        return model.eval()
+    except Exception:  # noqa: BLE001
+        return B.get_model(with_star=False).eval()
+
+
 @functools.lru_cache(maxsize=1)
 def _model():
-    import torch
-    from torchaudio.pipelines import MMS_FA
+    """The aligner, quantized: ~0.6 GB resident."""
     import ctypes
     import gc
-    model = MMS_FA.get_model(with_star=False).eval()
-    # quantize in place and hand the freed full-precision weights back to the system: otherwise ~3 GB stays
-    # resident for a model that needs ~0.6 GB
+    import torch
+    from torchaudio.pipelines import MMS_FA
+    model = _full_precision()
+    with torch.no_grad():         # nothing may keep pointing into the mapped file, so that it's released afterwards:
+        for mod in model.modules():   # the biases get packed with the int8 weights as they are...
+            if isinstance(mod, torch.nn.Linear) and mod.bias is not None:
+                mod.bias.data = mod.bias.data.clone()
     model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
+    with torch.no_grad():         # ...and the layers left in full precision (~100 MB) are copied off it
+        for t in list(model.parameters()) + list(model.buffers()):
+            t.data = t.data.clone()
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)

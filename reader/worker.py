@@ -18,17 +18,22 @@ from .segment import Unit
 log = logging.getLogger("reader.worker")
 
 
-def mem_available_gb() -> float:
+from .machine import headroom_gb
+
+
+def _give_back() -> None:
+    """Hand freed memory back to the system after each piece. The allocator otherwise keeps what every sentence's
+    scratch tensors used, and the process grows ~17 MB a sentence (measured: 1.9 -> 2.6 GB in 20 sentences, flat
+    at 1.9 GB with this). Takes ~250 ms, so once per piece rather than per sentence."""
     try:
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) / 1e6
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
     except OSError:
         pass
-    return 99.0
 
-
-SIDE_LANE_MIN_GB, SIDE_LANE_STOP_GB = 4.5, 2.0    # a side lane costs ~2 GB (one more Pocket process + its alignments)
+# a side lane costs one more voice process (~1.5-2 GB): start one only with room for it under the service's limit
+# (and on the machine), and leave a chapter when the room gets thin
+SIDE_LANE_MIN_GB, SIDE_LANE_STOP_GB = 2.5, 1.0
 
 
 def lanes_for(threads: int) -> int:
@@ -131,7 +136,7 @@ class Worker(threading.Thread):
         """A whole later chapter for a side lane: the listened book's next chapters first, then the other books'.
         Starting a lane needs memory to spare; a lane already running (its voice process loaded) only needs to
         stay clear of the floor."""
-        if lib.settings()["paused"] or mem_available_gb() < (SIDE_LANE_STOP_GB if warm else SIDE_LANE_MIN_GB):
+        if lib.settings()["paused"] or headroom_gb() < (SIDE_LANE_STOP_GB if warm else SIDE_LANE_MIN_GB):
             return None                                # not enough memory to spare: lane 0 alone
         with self.claims_lock:
             for k, (m, ch0, _u0) in enumerate(self._order()):
@@ -163,7 +168,7 @@ class Worker(threading.Thread):
                 warm = True
                 for s in range(len(chap["segments"])):
                     if lane > self.side_wanted or self.lane0_at == (m["id"], chap["index"]) or lib.settings()["paused"] \
-                            or mem_available_gb() < SIDE_LANE_STOP_GB:
+                            or headroom_gb() < SIDE_LANE_STOP_GB:
                         log.info("lane %d leaves chapter %d (lane 0 is there, fewer lanes, paused, or memory)", lane, chap["index"])
                         break                              # fewer lanes, the listener came here, or memory is tight
                     if not lib.segment_ready(m["id"], chap["index"], s):
@@ -340,6 +345,7 @@ class Worker(threading.Thread):
         with self._lock_for(m["id"], chap["index"]):
             lib._write(out / f"{s}.json", dict(duration=tl["duration"], units=units_out))
             self.build_chapter(m, chap)
+        _give_back()
         took = time.time() - t0
         self.status["rendered_secs"] += tl["duration"]
         # speed = audio rendered / wall time over the last 15 minutes (one slow segment no longer swings it)

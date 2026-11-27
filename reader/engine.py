@@ -213,6 +213,16 @@ def synth_job(lang: str, voice: str, text: str, seed: int, context: np.ndarray |
     return audio
 
 
+def _worker_init():
+    """In each synthesizer process: if memory ever runs out, be the one the kernel stops. The pool replaces it and
+    the sentence is rendered again; the process serving the app is left alone."""
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
+
+
 def synth_pool(size: int):
     """A process pool of `size` synthesizers (recreated when the size changes); None for size < 1."""
     global _pool, _pool_size
@@ -224,7 +234,8 @@ def synth_pool(size: int):
         if _pool is not None:
             _pool.shutdown(wait=False, cancel_futures=True)
         # each process reloads its model after 200 sentences: memory can't creep up over a long book
-        _pool = ProcessPoolExecutor(max_workers=size, mp_context=multiprocessing.get_context("spawn"), max_tasks_per_child=200)
+        _pool = ProcessPoolExecutor(max_workers=size, mp_context=multiprocessing.get_context("spawn"), max_tasks_per_child=200,
+                                    initializer=_worker_init)
         _pool_size = size
     return _pool
 

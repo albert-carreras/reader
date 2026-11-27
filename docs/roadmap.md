@@ -48,6 +48,18 @@
   covers it), a language/voice confirmation step before rendering (the first 30 s piece is ready in about half a
   minute and changing either costs only that), flagging empty alignments (none in 2,208 takes)
 
+**App feel (2026-11-27):** the web app made to behave like a native one instead of an IPA (sideloading means
+re-signing every 7 days without a paid account, and a WebKit shell plays audio the same way):
+- push/pop screen transitions (View Transitions), an edge swipe back with the previous screen underneath, scroll kept
+  per screen, and a navigation stack that survives iOS closing the app (it reopens on the same screen)
+- screens paint from what the phone has, then refresh; skeletons instead of blank waits; covers fade in once
+- iOS look: frosted nav bars with large titles, bottom sheets with drag to close, action sheets instead of `confirm()`,
+  the native switch, the spoke activity indicator, light/dark launch screens
+- eight themes plus Auto (the cream-and-terracotta default is gone), five reading fonts, a text-size stepper
+- time left in the book in the player bar; chapter and book time, and a progress line, in the now-playing bar
+- still out of reach for a home-screen app: background downloads, the share sheet ("Open in reader"), haptics,
+  widgets/Live Activities/Siri
+
 **Next:**
 - **Done (round 2):** previous-sentence context. Each sentence's voice prompt is the reference clip plus the end of the sentence before, picked blind in both languages over plain takes and over cloned LibriVox narrators. Rendering becomes a chain, ~1.0–1.15x realtime at Medium.
 - faster context rendering: run separate chains on different chapters in parallel (a chapter start needs no context)

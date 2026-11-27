@@ -44,10 +44,23 @@ along: the sentence highlighted, the word underlined. English and Spanish.
   ("about 25 s, 2 of 6 sentences"), after which it plays by itself; and a plain reason when it can't play (offline and
   not downloaded, rendering paused, server unreachable).
 - **Reading.** Sentence highlighting and a word underline. Long sentences highlight and step by clause.
-  - Speed control, themes, and offline downloads ("next 3 hours" or the whole book).
+  - Speed control, offline downloads ("next 3 hours" or the whole book), text size and five reading fonts.
+- **Time left.** The player shows the time left in the chapter and, roughly, in the book, at your speed. The
+  now-playing bar shows both too, with a thin line for the chapter.
 - **Background sounds** under the narration (≋ in the reader): rain, a fireplace, waves, space, focus (binaural beats)
   or brown noise, with a volume slider. They are made on the phone as seamless one-minute loops, so there is nothing
   to download and they work offline. They follow play and pause.
+
+**Feels like an iPhone app**
+- **Screens push and pop.** They slide in from the right, slide back on Back, and the edge swipe takes you back with
+  your finger (the screen before waits underneath). Each screen comes back scrolled where you left it.
+- **No waiting between screens.** Every screen paints at once from what the phone already has, then refreshes in
+  place. Anything not on the phone yet shows its outline (a skeleton) instead of a blank page.
+- **Reopens where you were.** When iOS has closed the app in the background, it opens on the same screen, with Back
+  still leading where it should.
+- **Native controls:** frosted nav bars with large titles, bottom sheets you pull down to close, action sheets for
+  confirmations, the iOS switch and activity indicator, and launch screens in the phone's light or dark colours.
+- **Themes:** Auto (Light by day, Dark by night), Light, Dark, Sepia, Paper, Sage, Dusk, Quiet and Black.
 
 **Rendering**
 - **Renders from where you are listening.** The next pieces come first, so you rarely wait. Pieces are 30 s, so a part

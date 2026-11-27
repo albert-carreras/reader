@@ -1,6 +1,6 @@
 // reader service worker: keeps the app shell available so the app opens instantly and offline.
 // Book data and audio always come from the network (audio is cached by the browser's HTTP cache).
-const SHELL = "reader-shell-v4";
+const SHELL = "reader-shell-v5";
 const FILES = ["/", "/static/app.js", "/static/sounds.js", "/static/style.css", "/manifest.webmanifest", "/static/icons/icon-192.png", "/static/icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {

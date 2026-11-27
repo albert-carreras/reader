@@ -3,8 +3,12 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const app = $("#app");
 const audio = $("#audio");
 
+// the iOS activity indicator: eight spokes, the brightest leading as it steps round
+const SPIN = `<svg class="spin" viewBox="0 0 24 24">${[1, .85, .7, .58, .47, .38, .3, .24].map((o, k) =>
+  `<line x1="12" y1="2.8" x2="12" y2="7.2" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" opacity="${o}" transform="rotate(${-45 * k} 12 12)"/>`).join("")}</svg>`;
 const ICON = {
-  spin: '<svg class="spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="34 60"/></svg>',
+  spin: SPIN,
+  navback: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4.8L7.3 12l7.2 7.2"/></svg>',
   back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
   play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/></svg>',
   pause: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>',
@@ -38,6 +42,15 @@ addEventListener("error", (e) => clog("js-error", `${e.message} @${e.lineno}`));
 addEventListener("unhandledrejection", (e) => clog("js-reject", e.reason?.message || e.reason));
 
 const KEEP_OFFLINE = /^\/api\/books(\/[a-z0-9-]+)?$/;      // library + book pages are always kept for offline use
+// Screens paint at once from the last answer they got (kept in memory, and on the phone for the library and book
+// pages), then refresh it in place: moving between screens never waits on the network.
+const MEMO = /^\/api\/(books(\/[a-z0-9-]+)?|system|storage|status)$/;
+const memo = new Map();
+const warmMemo = (paths) => Promise.all(paths.filter((p) => p && !memo.has(p)).map(async (p) => {
+  const v = await idb.get(p).catch(() => null);
+  if (v?.type === "json" && !memo.has(p)) memo.set(p, v.data);
+}));
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const api = async (path, opts = {}) => {
   const isGet = !opts.method || opts.method === "GET";
   let r;
@@ -52,6 +65,7 @@ const api = async (path, opts = {}) => {
     throw Object.assign(new Error((await r.json().catch(() => ({}))).detail || r.statusText), { status: r.status });
   }
   const j = await r.json();
+  if (isGet && MEMO.test(path)) memo.set(path, j);
   if (isGet && KEEP_OFFLINE.test(path)) idb.put(path, { type: "json", data: j }).catch(() => {});
   return j;
 };
@@ -94,9 +108,13 @@ const store = {
   get: (k, d) => { try { return JSON.parse(localStorage.getItem("reader:" + k)) ?? d; } catch { return d; } },
   set: (k, v) => localStorage.setItem("reader:" + k, JSON.stringify(v)),
 };
+// covers fade in the first time they load; after that they're simply there (no flash when a screen repaints)
+const shownCovers = new Set();
 const coverEl = (b) => {
   const c = h("div", { class: "cover" });
-  const img = h("img", { src: `/api/books/${b.id}/cover`, alt: "", loading: "lazy" });
+  const src = `/api/books/${b.id}/cover`;
+  const img = h("img", { src, alt: "", loading: "lazy", decoding: "async", class: shownCovers.has(src) ? "in now" : "" });
+  img.onload = () => { shownCovers.add(src); img.classList.add("in"); };
   img.onerror = async () => {
     const local = await idb.get(`/api/books/${b.id}/cover`).catch(() => null);
     if (local?.data && !img.dataset.local) { img.dataset.local = "1"; img.src = URL.createObjectURL(local.data); return; }
@@ -113,18 +131,49 @@ const coverEl = (b) => {
 // iOS only starts audio inside a tap: the reader preloads the right file, so a tap on play starts it synchronously.
 const realPlaying = () => !audio.paused;
 
-// theme & text size
+// theme, reading font & text size. Auto follows the phone (Light by day, Dark by night). index.html applies the
+// saved theme before the first paint, so the app never flashes the wrong colours.
+const THEMES = [["auto", "Auto"], ["light", "Light"], ["dark", "Dark"], ["sepia", "Sepia"], ["paper", "Paper"],
+  ["sage", "Sage"], ["dusk", "Dusk"], ["quiet", "Quiet"], ["black", "Black"]];
+const FONTS = [["iowan", "Iowan"], ["newyork", "New York"], ["charter", "Charter"], ["georgia", "Georgia"], ["system", "San Francisco"]];
+const SIZES = [15, 17, 19, 21, 23, 26, 30];
+const darkMQ = matchMedia("(prefers-color-scheme: dark)");
+const syncChrome = () => requestAnimationFrame(() => {    // the status bar takes the colour of the screen under it
+  const bg = getComputedStyle(document.documentElement).backgroundColor;
+  document.querySelectorAll('meta[name="theme-color"]').forEach((m) => m.setAttribute("content", bg));
+});
 const applyLook = () => {
-  requestAnimationFrame(() => {
-    const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
-    document.querySelectorAll('meta[name="theme-color"]').forEach((m) => m.setAttribute("content", bg));
-  });
+  const root = document.documentElement;
   const theme = store.get("theme", "auto");
-  if (theme === "auto") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.setAttribute("data-theme", theme);
-  document.documentElement.style.setProperty("--text-size", store.get("size", window.innerWidth < 640 ? 19 : 21) + "px");
+  root.dataset.theme = theme === "auto" ? (darkMQ.matches ? "dark" : "light") : THEMES.some(([k]) => k === theme) ? theme : "light";
+  root.dataset.font = store.get("font", "iowan");
+  root.style.setProperty("--text-size", store.get("size", window.innerWidth < 640 ? 19 : 21) + "px");
+  syncChrome();
 };
+darkMQ.addEventListener?.("change", applyLook);
 applyLook();
+// a theme picker: each tile wears its own theme
+const themeTiles = (onpick) => {
+  const cur = store.get("theme", "auto");
+  return h("div", { class: "tiles" }, THEMES.map(([k, label]) => h("button", { class: "tile" + (k === cur ? " on" : ""), "aria-pressed": String(k === cur),
+    onclick: () => { store.set("theme", k); applyLook(); onpick?.(); } },
+  k === "auto" ? h("div", { class: "sw-big", "data-theme": "light" }, "Aa", h("div", { class: "split", "data-theme": "dark" }, "Aa"))
+    : h("div", { class: "sw-big", "data-theme": k }, "Aa"), label)));
+};
+const fontChips = (onpick) => {
+  const cur = store.get("font", "iowan");
+  return h("div", { class: "fonts" }, FONTS.map(([k, label]) => h("button", { class: k === cur ? "on" : "", "data-font": k,
+    onclick: () => { store.set("font", k); applyLook(); onpick?.(); } }, label)));
+};
+const sizeStepper = (onpick) => {
+  const cur = store.get("size", window.innerWidth < 640 ? 19 : 21);
+  const k = Math.max(0, SIZES.findIndex((z) => z >= cur));
+  const step = (d) => { store.set("size", SIZES[Math.max(0, Math.min(SIZES.length - 1, k + d))]); applyLook(); onpick?.(); };
+  return h("div", { class: "size-row" },
+    h("button", { "aria-label": "Smaller text", style: "font-size:.85rem", onclick: () => step(-1), disabled: k === 0 }, "A"),
+    h("span", { class: "val" }, `${cur} pt`),
+    h("button", { "aria-label": "Larger text", style: "font-size:1.35rem", onclick: () => step(1), disabled: k === SIZES.length - 1 }, "A"));
+};
 
 // positions: server is the source of truth, a local copy covers offline gaps (car, metro) and syncs later
 const positions = {
@@ -276,10 +325,96 @@ const bytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${Ma
 const eta = (s) => (s == null ? "" : s < 90 ? "under 2 min" : human(s));
 const short = (s) => { s = Math.round(s || 0); const hh = Math.floor(s / 3600), mm = Math.round((s % 3600) / 60); return hh ? `${hh}h ${String(mm).padStart(2, "0")}m` : s < 90 ? "< 2m" : `${mm}m`; };
 const pct = (a, b) => Math.round((100 * (a || 0)) / Math.max(b || 1, 1));
+// Safari (17.4+) draws the real iOS switch for <input type=checkbox switch>; elsewhere a look-alike
+const NATIVE_SWITCH = "switch" in HTMLInputElement.prototype;
 const switchEl = (on, onchange, label) => {
-  const el = h("button", { class: "switch" + (on ? " on" : ""), role: "switch", "aria-checked": String(on), "aria-label": label || "", onclick: (e) => { e.stopPropagation(); onchange(!on); } }, h("i"));
+  if (NATIVE_SWITCH) {
+    const el = h("input", { type: "checkbox", switch: true, checked: on, "aria-label": label || "", onclick: (e) => e.stopPropagation() });
+    el.addEventListener("change", () => setTimeout(() => onchange(el.checked), 180));     // let the knob finish sliding
+    return el;
+  }
+  const el = h("button", { class: "switch" + (on ? " on" : ""), role: "switch", "aria-checked": String(on), "aria-label": label || "",
+    onclick: (e) => { e.stopPropagation(); el.classList.toggle("on", !on); setTimeout(() => onchange(!on), 180); } }, h("i"));
   return el;
 };
+
+// ------------------------------------------------------------------ sheets: up from the bottom, drag down to close
+const sheets = new Set();
+const closeSheets = (now = false) => { for (const s of [...sheets]) s.close(now); };
+function openSheet(build, { cls = "", onClose } = {}) {
+  closeSheets(true);
+  const scrim = h("div", { class: "scrim" });
+  const panel = h("div", { class: "bsheet " + cls, role: "dialog", "aria-modal": "true" }, h("div", { class: "grabber" }));
+  const s = {
+    panel,
+    close(now = false) {
+      if (!sheets.delete(s)) return;
+      if (!sheets.size) document.documentElement.classList.remove("sheet-open");
+      onClose?.();
+      if (now) { panel.remove(); scrim.remove(); return; }
+      panel.classList.remove("dragging", "settle");
+      panel.style.transform = "";
+      panel.classList.add("out"); scrim.classList.add("out");
+      setTimeout(() => { panel.remove(); scrim.remove(); }, 260);
+    },
+  };
+  build(panel, s);
+  scrim.addEventListener("click", () => s.close());
+  dragToClose(panel, scrim, () => s.close());
+  sheets.add(s);
+  document.documentElement.classList.add("sheet-open");      // the page under a sheet stays put
+  document.body.append(scrim, panel);
+  return s;
+}
+// pull the sheet down (from anywhere, as long as its list is scrolled to the top) and let go to close it
+function dragToClose(panel, scrim, close) {
+  let y0 = 0, dy = 0, t0 = 0, active = false, armed = false;
+  panel.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1 || e.target.closest("input[type=range], .fonts")) return;
+    const list = e.target.closest(".list");
+    armed = !list || list.scrollTop <= 0;
+    y0 = e.touches[0].clientY; dy = 0; t0 = performance.now(); active = false;
+  }, { passive: true });
+  panel.addEventListener("touchmove", (e) => {
+    if (!armed) return;
+    dy = e.touches[0].clientY - y0;
+    if (!active && dy > 8) { active = true; panel.classList.add("dragging"); }
+    if (!active) { if (dy < -4) armed = false; return; }
+    e.preventDefault();
+    const d = Math.max(0, dy);
+    panel.style.transform = `translateY(${d}px)`;
+    scrim.style.opacity = String(Math.max(0, 1 - d / (panel.offsetHeight || 400)));
+  }, { passive: false });
+  const end = () => {
+    if (!active) { armed = false; return; }
+    active = armed = false;
+    const v = dy / Math.max(1, performance.now() - t0);
+    panel.classList.remove("dragging");
+    if (dy > Math.min(140, panel.offsetHeight * 0.35) || (v > 0.6 && dy > 30)) {
+      panel.classList.add("settle"); panel.style.transform = "translateY(100%)"; scrim.classList.add("out");
+      setTimeout(close, 280);
+    } else {
+      panel.classList.add("settle"); panel.style.transform = ""; scrim.style.opacity = "";
+      setTimeout(() => panel.classList.remove("settle"), 320);
+    }
+  };
+  panel.addEventListener("touchend", end);
+  panel.addEventListener("touchcancel", end);
+}
+// a confirmation, the iOS way: an action sheet with the action (red when it destroys something) and Cancel
+function ask({ title, message, ok = "OK", danger = false }) {
+  return new Promise((resolve) => {
+    let answer = false;
+    const s = openSheet((p) => {
+      const pick = (v) => { answer = v; s.close(); };
+      p.append(
+        h("div", { class: "as-group" },
+          title || message ? h("div", { class: "as-head" }, title ? h("b", {}, title) : null, message || null) : null,
+          h("button", { class: danger ? "danger" : "", onclick: () => pick(true) }, ok)),
+        h("div", { class: "as-group" }, h("button", { class: "cancel", onclick: () => pick(false) }, "Cancel")));
+    }, { cls: "action", onClose: () => resolve(answer) });
+  });
+}
 const seg = (options, value, onpick) => h("div", { class: "segctl" }, options.map(([v, label]) =>
   h("button", { class: v === value ? "on" : "", onclick: () => onpick(v) }, label)));
 
@@ -292,9 +427,10 @@ const ICON2 = {
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
   warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 8v5M12 16.5v.5"/><path d="M10.3 3.9L2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>',
 };
-let chipTimer = 0;
+// one chip for the app's life: it keeps its last state between screens instead of loading again on each
+let chipTimer = 0, chipEl = null;
 const renderChip = () => {
-  const chip = h("a", { class: "chip-status skeleton", href: "#/system", title: "Rendering & storage" }, h("span", { class: "chip-ico" }), h("span", { class: "chip-txt" }, "Renderer"));
+  const chip = chipEl ||= h("a", { class: "chip-status skeleton", href: "#/system", title: "Rendering & storage" }, h("span", { class: "chip-ico" }), h("span", { class: "chip-txt" }, "Renderer"));
   const tick = async (first) => {
     if (!first && !chip.isConnected) return clearInterval(chipTimer);
     try {
@@ -319,10 +455,32 @@ const renderChip = () => {
   tick(true);
   return chip;
 };
-const topbar = (left, center, ...right) => h("header", { class: "top" }, h("div", { class: "wrap" }, left, center || h("div", { class: "grow" }), ...right));
-const brand = () => h("a", { class: "brand", href: "#/" }, h("i"), "reader");
-const back = (href, title) => h("a", { class: "iconbtn", href, title, html: ICON.back });
-const gear = () => h("a", { class: "iconbtn", href: "#/settings", title: "Settings", html: ICON2.gear });
+// the navigation bar: what's on the left, a title in the middle (shown once the page's own title scrolls under
+// it, unless `always`), buttons on the right
+const topbar = ({ lead = null, title = "", always = false, trail = [] } = {}) => h("header", { class: "top" }, h("div", { class: "wrap" },
+  h("div", { class: "lead" }, lead), h("div", { class: "page-title" + (always ? " always" : "") }, title), h("div", { class: "trail" }, ...trail)));
+// "‹ Library": goes back to the screen you came from (its name), or up to `parent` when there's none (a cold start)
+const back = (parent) => {
+  const prev = nav.i > 0 ? nav.pages[nav.i - 1]?.hash : parent;
+  return h("a", { class: "navback", href: prev || parent, onclick: (e) => { e.preventDefault(); goBack(parent); } },
+    h("span", { html: ICON.navback, style: "display:contents" }), h("span", {}, screenName(prev || parent)));
+};
+const gear = () => h("a", { class: "iconbtn tint", href: "#/settings", title: "Settings", "aria-label": "Settings", html: ICON2.gear });
+// put a screen on: its nav bar starts clear or frosted depending on where the page is scrolled
+const mount = (...nodes) => {
+  app.replaceChildren(...nodes.flat().filter(Boolean));
+  chromeOnScroll();
+};
+// iOS nav bars: clear at the top of the page, frosted with a hairline once content scrolls under them, and the
+// small title appears when the page's large title (or the book's title) has gone under the bar
+function chromeOnScroll() {
+  const top = app.querySelector(":scope > .top");
+  if (!top) return;
+  top.classList.toggle("scrolled", scrollY > 2);
+  const big = app.querySelector(".large-title h1, .book-hero h1");
+  if (big) top.classList.toggle("titled", big.getBoundingClientRect().bottom < top.getBoundingClientRect().bottom + 2);
+}
+addEventListener("scroll", chromeOnScroll, { passive: true });
 
 // ------------------------------------------------------------------ upload
 const importing = new Map();     // job id -> {name, state}
@@ -363,10 +521,27 @@ addEventListener("dragover", (e) => e.preventDefault());
 addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; $("#drop").hidden = true; upload(e.dataTransfer.files[0]); });
 
 // ------------------------------------------------------------------ library
-async function viewLibrary() {
+// paint a screen now from what this device already has (or its skeleton), then again if the server says otherwise
+async function freshen(path, paint, skeleton) {
+  const gen = routeGen, have = memo.get(path);
+  if (have) paint(have); else skeleton?.();
+  let fresh;
+  try { fresh = await api(path); }
+  catch (e) { if (have) return; throw e; }       // offline with something on screen: keep it
+  if (gen === routeGen && (!have || !same(have, fresh))) paint(fresh, true);
+}
+const libraryTop = () => topbar({ lead: renderChip(), title: "Library",
+  trail: [gear(), h("button", { class: "iconbtn tint", title: "Add book", "aria-label": "Add book", onclick: picker, html: ICON.plus })] });
+function viewLibrary() {
   player.hide();
-  const books = await api("/api/books");
-  const top = topbar(brand(), null, renderChip(), gear(), h("button", { class: "iconbtn add", title: "Add book", onclick: picker, html: ICON.plus }));
+  return freshen("/api/books", paintLibrary, () => {
+    const grid = h("div", { class: "grid" }, [0, 1, 2, 3].map(() => h("div", { class: "card" }, h("div", { class: "cover sk" }),
+      h("div", {}, h("div", { class: "sk sk-line", style: "width:85%" }), h("div", { class: "sk sk-line", style: "width:55%" })))));
+    mount(libraryTop(), h("main", { class: "wrap" }, h("div", { class: "large-title" }, h("h1", {}, "Library"), h("div", { class: "sub" }, " ")), grid));
+  });
+}
+function paintLibrary(books) {
+  const top = libraryTop();
   const main = h("main", { class: "wrap" });
   const recent = books.find((b) => positions.best(b.id, b.position));
   if (recent) {                 // the bottom bar offers it (and plays it in place) until something is playing
@@ -374,8 +549,8 @@ async function viewLibrary() {
     const ch = recent.chapters.find((c) => c.index === pos.chapter);
     player.remember(recent, pos.chapter, ch?.title);
   }
+  main.append(h("div", { class: "large-title" }, h("h1", {}, "Library"), h("div", { class: "sub" }, books.length ? `${books.length} book${books.length > 1 ? "s" : ""}` : " ")));
   if (!navigator.onLine) main.append(h("div", { class: "offline-note" }, "You're offline · books on this phone still play"));
-  main.append(h("div", { class: "lib-head" }, h("h1", {}, "Library"), books.length ? h("span", { class: "muted" }, `${books.length} book${books.length > 1 ? "s" : ""}`) : null));
   if (!books.length && !importing.size) {
     main.append(h("div", { class: "empty" }, h("h2", {}, "No books yet"), h("p", {}, "Drop an EPUB anywhere on this page, or use +."),
       h("button", { class: "btn", onclick: picker }, "Choose an EPUB")));
@@ -396,19 +571,33 @@ async function viewLibrary() {
     }
     main.append(grid);
   }
-  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
+  mount(top, main, player.mini());
 }
 
 // ------------------------------------------------------------------ book page
-async function viewBook(id) {
+function viewBook(id) {
   player.hide();
-  const b = await api(`/api/books/${id}`);
+  return freshen(`/api/books/${id}`, (b) => paintBook(id, b), () => {
+    const lite = memo.get("/api/books")?.find((x) => x.id === id);       // from the library: cover, title, author
+    const hero = h("section", { class: "book-hero" }, lite ? coverEl(lite) : h("div", { class: "cover sk" }),
+      lite ? h("div", {}, h("h1", {}, lite.title), h("div", { class: "by" }, lite.author), h("div", { class: "muted small" }, `${human(lite.progress?.total_est)}`))
+        : h("div", {}, h("div", { class: "sk sk-line", style: "height:1.4rem;width:80%" }), h("div", { class: "sk sk-line", style: "width:50%" })));
+    const rows = h("ul", { class: "chapters sk-list" }, [72, 54, 66, 48, 60, 70].map((w) => h("li", {}, h("div", { class: "sk sk-line", style: `width:${w}%` }))));
+    mount(topbar({ lead: back("#/"), title: lite?.title || "" }),
+      h("main", { class: "wrap narrow" }, hero, h("div", { class: "sk", style: "height:50px;border-radius:14px" }),
+        h("section", { class: "card-box" }, h("div", { class: "sk sk-line", style: "width:45%" }), h("div", { class: "sk sk-line", style: "width:70%" }), h("div", { class: "sk sk-line", style: "height:6px;margin-top:1rem" })),
+        h("h2", { class: "section" }, "Chapters"), rows), player.mini());
+  });
+}
+function paintBook(id, b) {
+  const gen = routeGen;
+  const repaint = async () => { const fresh = await api(`/api/books/${id}`); if (gen === routeGen) paintBook(id, fresh); };
   const pos = positions.best(id, b.position);
   const playable = b.chapters.filter((c) => c.n_units);
   const cur = (pos && b.chapters.find((c) => c.index === pos.chapter)) || playable.find((c) => c.include);
   const p = b.progress;
   const done = p.ready_est >= p.total_est - 1;
-  const top = topbar(back("#/", "Library"), null, renderChip(), gear());
+  const top = topbar({ lead: back("#/"), title: b.title });
   const live = player.tape && player.book;
   // the bar resumes this book from its newest place (this phone's or the server's), not from an older chapter
   if (!live && pos && cur && store.get("recent", null)?.id === id) player.remember(b, cur.index, cur.title);
@@ -420,8 +609,8 @@ async function viewBook(id) {
   const state = { done: ["done", "Fully rendered"], off: ["off", "Off for this book"], paused: ["off", "Paused · all rendering is paused"],
     rendering: ["on", "Rendering now" + (where.length ? ` · ${where.join(", ")}` : "")], queued: ["queued", "Queued · another book renders first"],
     upgrading: ["queued", "Getting ready · re-reading the book for the new narration"] }[st] || ["queued", "Queued"];
-  const toggleRender = async () => { await api(`/api/books/${id}`, { method: "PATCH", body: JSON.stringify({ render: !b.render }) }); viewBook(id); };
-  const resumeAll = async () => { await api("/api/system", { method: "PUT", body: JSON.stringify({ paused: false }) }); viewBook(id); };
+  const toggleRender = async () => { await api(`/api/books/${id}`, { method: "PATCH", body: JSON.stringify({ render: !b.render }) }); repaint(); };
+  const resumeAll = async () => { await api("/api/system", { method: "PUT", body: JSON.stringify({ paused: false }) }); repaint(); };
   const legend = (cls, text) => h("span", { class: "key" }, h("i", { class: `sw ${cls}` }), text);
   const renderCard = h("section", { class: "card-box" },
     h("div", { class: "row-between" },
@@ -455,7 +644,7 @@ async function viewBook(id) {
       h("div", { class: "row-between stack" },
         h("div", {}, h("div", { class: "label" }, "Download for offline"), h("div", { class: "muted small" }, line)),
         seg([["off", "Off"], ["next", "Next 3 h"], ["whole", "Whole book"]], mode, async (v) => {
-          if (v === "off" && n && !confirm("Remove this book's downloads from this phone?")) return;
+          if (v === "off" && n && !(await ask({ message: "Remove this book's downloads from this phone?", ok: "Remove Downloads", danger: true }))) return;
           store.set(`dl:${id}`, v); paintDl(); await offline.setMode(id, v);
         })),
       busy ? h("div", { class: "bar thick" }, h("i", { class: "ready", style: `width:${pct(busy.done, busy.total)}%` })) : null);
@@ -469,16 +658,19 @@ async function viewBook(id) {
   setTimeout(() => { dlBox.dataset.mounted = "1"; offline.sync(id); }, 0);
 
   const lang = h("select", { onchange: async () => {
-    if (!confirm(`Read this book as ${b.langs[lang.value]}? Its audio will be rendered again from scratch.`)) { lang.value = b.lang; return; }
+    if (!(await ask({ title: `Read this book as ${b.langs[lang.value]}?`, message: "Its audio will be rendered again from scratch.", ok: `Read as ${b.langs[lang.value]}`, danger: true }))) { lang.value = b.lang; return; }
     await api(`/api/books/${id}`, { method: "PATCH", body: JSON.stringify({ lang: lang.value }) });
-    toast(`Language: ${b.langs[lang.value]}`); viewBook(id);
+    toast(`Language: ${b.langs[lang.value]}`); repaint();
   } }, Object.entries(b.langs).map(([k, v]) => h("option", { value: k, selected: k === b.lang }, v)));
   const settingsBox = h("section", { class: "card-box rows" },
     h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Language"), h("div", { class: "muted small" }, "How the text is read: numbers, names, narrator")), lang),
     h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Remove book"), h("div", { class: "muted small" }, "Deletes the book, its audio and your place")),
       h("button", { class: "btn danger sm", onclick: async () => {
-        if (!confirm(`Remove “${b.title}”?`)) return;
-        await api(`/api/books/${id}`, { method: "DELETE" }); location.hash = "#/";
+        if (!(await ask({ title: `Remove “${b.title}”?`, message: "This deletes the book, its audio and your place in it.", ok: "Remove Book", danger: true }))) return;
+        await api(`/api/books/${id}`, { method: "DELETE" });
+        memo.delete(`/api/books/${id}`);
+        if (memo.has("/api/books")) memo.set("/api/books", memo.get("/api/books").filter((x) => x.id !== id));
+        goBack("#/");
       } }, "Remove")));
 
   const main = h("main", { class: "wrap narrow" },
@@ -490,24 +682,30 @@ async function viewBook(id) {
     renderCard, dlBox,
     h("h2", { class: "section" }, "Chapters"), list,
     h("h2", { class: "section" }, "Book"), settingsBox);
-  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
+  mount(top, main, player.mini());
 }
 
 // ------------------------------------------------------------------ rendering & storage
 let sysTimer = 0;
-async function viewSystem() {
+const skRows = (n, cls = "row-between") => Array.from({ length: n }, (_, k) => h("div", { class: cls },
+  h("div", {}, h("div", { class: "sk sk-line", style: `width:${[55, 42, 63, 48][k % 4]}%` }), h("div", { class: "sk sk-line", style: `width:${[78, 66, 84, 70][k % 4]}%;height:.65em` }))));
+function viewSystem() {
   player.hide();
-  const top = topbar(back("#/", "Library"), h("div", { class: "page-title" }, "Rendering & storage"), gear());
+  const top = topbar({ lead: back("#/"), title: "Rendering", always: true });
   const main = h("main", { class: "wrap narrow" });
-  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
   const statusBox = h("section", { class: "card-box" }), queueBox = h("section", { class: "card-box rows" }), storeBox = h("section", { class: "card-box rows" });
   const machineBox = h("section", { class: "card-box rows" });
   main.append(statusBox, h("h2", { class: "section" }, "Rendering by book"), queueBox, h("h2", { class: "section" }, "Laptop"), machineBox, h("h2", { class: "section" }, "Storage"), storeBox);
+  mount(top, main, player.mini());
+  fill(statusBox, ...skRows(1, "row-between"), h("div", { class: "sk", style: "height:56px;margin-top:.9rem;border-radius:10px" }));
+  fill(queueBox, ...skRows(3)); fill(machineBox, ...skRows(2)); fill(storeBox, ...skRows(2));
 
   const paint = async () => {
     if (!main.isConnected) return clearInterval(sysTimer);
     const s = await api("/api/system").catch(() => null);
-    if (!s) return;
+    if (s && main.isConnected) draw(s);
+  };
+  const draw = (s) => {
     const w = s.worker, job = w.job, paused = s.settings.paused;
     const cur = job && s.queue.find((q) => q.id === job.book);
     const lanes = (w.state === "rendering" ? 1 : 0) + (w.lanes || []).length;
@@ -539,13 +737,14 @@ async function viewSystem() {
       : [h("div", { class: "muted" }, "No books yet.")]));
   };
   const paintStorage = async () => {
-    fill(storeBox, h("div", { class: "muted small" }, "Measuring…"));
     const st = await api("/api/storage").catch(() => null);
-    if (!st) return;
+    if (st && storeBox.isConnected) drawStorage(st);
+  };
+  const drawStorage = (st) => {
     const rows = [h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Free space on the laptop"), h("div", { class: "muted small" }, `${bytes(st.disk_free)} free of ${bytes(st.disk_total)}`)))];
     for (const b of st.books) rows.push(h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, b.title), h("div", { class: "muted small" }, `Audio ${bytes(b.audio)}`)),
       b.audio ? h("button", { class: "btn ghost sm", onclick: async () => {
-        if (!confirm(`Delete the rendered audio of “${b.title}”? It will be rendered again when needed.`)) return;
+        if (!(await ask({ title: `Delete the audio of “${b.title}”?`, message: "It will be rendered again when needed.", ok: "Delete Audio", danger: true }))) return;
         const r = await api(`/api/books/${b.id}/audio`, { method: "DELETE" }); toast(`Freed ${bytes(r.freed)}`); paintStorage();
       } }, "Clear audio") : null));
     rows.push(h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Sentence cache"),
@@ -553,9 +752,11 @@ async function viewSystem() {
       st.cache_stale ? h("button", { class: "btn ghost sm", onclick: async () => { const r = await api("/api/storage/clean", { method: "POST" }); toast(`Freed ${bytes(r.freed)}`); paintStorage(); } }, "Clean up") : null));
     fill(storeBox, ...rows);
   };
+  if (memo.has("/api/system")) draw(memo.get("/api/system"));
+  if (memo.has("/api/storage")) drawStorage(memo.get("/api/storage"));
   clearInterval(sysTimer);
   sysTimer = setInterval(paint, 4000);
-  await paint();
+  paint();
   paintStorage();
 }
 
@@ -592,8 +793,9 @@ function machineRows(m, rendering) {
 // ------------------------------------------------------------------ settings
 function viewSettings() {
   player.hide();
-  const top = topbar(back("#/", "Library"), h("div", { class: "page-title" }, "Settings"), h("span", { class: "iconbtn", "aria-hidden": "true" }));
-  const row = (label, hint, control) => h("div", { class: "row-between" + (control.classList.contains("segctl") ? " stack" : "") }, h("div", {}, h("div", { class: "label" }, label), hint ? h("div", { class: "muted small" }, hint) : null), control);
+  const top = topbar({ lead: back("#/"), title: "Settings" });
+  const row = (label, hint, control, stack) => h("div", { class: "row-between" + (stack || control.classList.contains("segctl") ? " stack" : "") + (stack ? " keep" : "") },
+    h("div", {}, h("div", { class: "label" }, label), hint ? h("div", { class: "muted small" }, hint) : null), control);
   const repaint = () => viewSettings();
   const dlIds = Object.keys(localStorage).filter((k) => k.startsWith("reader:dlx2:")).map((k) => k.slice(12));
   const dlTotal = dlIds.reduce((a, id) => a + offline.bytes(id), 0);
@@ -601,29 +803,33 @@ function viewSettings() {
   navigator.storage?.estimate?.().then((e) => { if (e.quota) dlHint.textContent += ` · room for about ${bytes(Math.max(0, e.quota - e.usage))} more`; }).catch(() => {});
   const dlRow = h("div", { class: "row-between" }, h("div", {}, h("div", { class: "label" }, "Downloads"), dlHint),
     dlTotal ? h("button", { class: "btn ghost sm", onclick: async () => {
-      if (!confirm("Remove all downloaded books from this phone? Your place in each book is kept.")) return;
+      if (!(await ask({ title: "Remove all downloads from this phone?", message: "Your place in each book is kept.", ok: "Remove All", danger: true }))) return;
       for (const id of dlIds) { store.set(`dl:${id}`, "off"); await offline.dropAll(id); }
       toast("Downloads removed"); repaint();
     } }, "Remove all") : null);
   const main = h("main", { class: "wrap narrow" },
+    h("div", { class: "large-title" }, h("h1", {}, "Settings")),
+    h("h2", { class: "section" }, "Look"),
+    h("section", { class: "card-box rows" },
+      row("Theme", null, themeTiles(repaint), true),
+      row("Reading font", null, fontChips(repaint), true),
+      row("Text size", null, sizeStepper(repaint), true)),
     h("h2", { class: "section" }, "Listening"),
     h("section", { class: "card-box rows" },
       row("Go back after a stop", "When playback stops (pause, call, navigation), resume a little earlier", seg([["off", "Off"], ["short", "Less"], ["normal", "Normal"], ["long", "More"]], prefs.rewind, (v) => { prefs.rewind = v; repaint(); })),
       row("Skip buttons", null, seg([[10, "10 s"], [15, "15 s"], [30, "30 s"]], prefs.skip, (v) => { prefs.skip = v; repaint(); })),
-      row("Continue to the next chapter", null, switchEl(prefs.autoNext, (v) => { prefs.autoNext = v; repaint(); }))),
+      row("Continue to the next chapter", null, switchEl(prefs.autoNext, (v) => { prefs.autoNext = v; }))),
     h("h2", { class: "section" }, "Reading"),
     h("section", { class: "card-box rows" },
       row("Highlight", null, seg([["both", "Sentence + word"], ["sentence", "Sentence"], ["off", "Off"]], prefs.highlight, (v) => { prefs.highlight = v; repaint(); })),
-      row("Follow the narration", "Scroll the text along while listening", switchEl(prefs.follow, (v) => { prefs.follow = v; repaint(); })),
-      row("Keep the screen on", "While listening with the text open", switchEl(prefs.wake, (v) => { prefs.wake = v; repaint(); })),
-      row("Text size", null, seg([17, 19, 21, 23, 26].map((z) => [z, String(z)]), store.get("size", 21), (v) => { store.set("size", v); applyLook(); repaint(); })),
-      row("Theme", null, seg([["auto", "Auto"], ["light", "Light"], ["sepia", "Sepia"], ["dark", "Dark"], ["black", "Black"]], store.get("theme", "auto"), (v) => { store.set("theme", v); applyLook(); repaint(); }))),
+      row("Follow the narration", "Scroll the text along while listening", switchEl(prefs.follow, (v) => { prefs.follow = v; })),
+      row("Keep the screen on", "While listening with the text open", switchEl(prefs.wake, (v) => { prefs.wake = v; }))),
     h("h2", { class: "section" }, "This phone"),
     h("section", { class: "card-box rows" }, dlRow),
     h("h2", { class: "section" }, "Rendering"),
     h("section", { class: "card-box rows" }, h("a", { class: "row-between", href: "#/system" }, h("div", {}, h("div", { class: "label" }, "Rendering & storage"), h("div", { class: "muted small" }, "Progress, pause, CPU use, disk space")), h("span", { class: "chev", html: ICON2.chev }))),
     h("p", { class: "muted small center" }, "Preferences on this page are saved on this device."));
-  app.replaceChildren(top, main, ...[player.mini()].filter(Boolean));
+  mount(top, main, player.mini());
 }
 
 // ------------------------------------------------------------------ background sounds
@@ -791,6 +997,9 @@ const skipIcon = (dir) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentC
   ? '<path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v4h4"/>' : '<path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4v4h-4"/>'}<text x="12" y="15.5" font-size="7.5" text-anchor="middle" fill="currentColor" stroke="none" font-family="system-ui" font-weight="700">${prefs.skip}</text></svg>`;
 const SPEED_PRESETS = [0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
 
+// a chapter's sentence layout (changes when the book is re-segmented)
+const sig = (ch) => ch.units.map((u) => `${u.block}:${u.start}`).join();
+
 // how far to go back when playback resumes after stopping (pause, call, Siri, navigation prompt...)
 const rewindFor = (ms) => (ms < 1500 ? 0 : ms < 30e3 ? 4 : ms < 5 * 60e3 ? 8 : ms < 60 * 60e3 ? 15 : 30) * (REWIND_SCALE[prefs.rewind] ?? 1);
 
@@ -813,10 +1022,18 @@ const player = {
     try { await this.openIn(bookId, chIndex, unit, autoplay, view); } finally { this.opening = false; }
   },
   async openIn(bookId, chIndex, unit, autoplay, view) {
+    const gen = routeGen;         // if you leave while it loads, it keeps loading but doesn't take the screen back
     this.hide();
     if (view) document.body.classList.add("has-player");
     this.follow = prefs.follow;
     const same = !!this.tape && this.book?.id === bookId;      // this book's stream is already going: keep it
+    if (view) {      // something on screen right away: the chapter that is playing as it is, or the page's outline
+      if (same && this.ch?.index === chIndex && this.chs.get(chIndex) && !Number.isFinite(unit)) {
+        this.render(); this.layout();
+        this.setCurrent(this.unitAtTime(this.chapterTime())?.i ?? 0, true);
+        this.setPlayIcon(audio.paused);
+      } else this.skeleton(bookId, chIndex);
+    }
     if (!same) {                                      // another book: stop this one and its pending retries
       audio.pause();
       for (const k of ["waiting", "retryTimer", "pollTimer", "stallTimer"]) clearTimeout(this[k]);
@@ -828,9 +1045,12 @@ const player = {
     const here = same && this.map(audio.currentTime)?.n === chIndex;
     if (!same) this.newTape();
     const e = await this.entry(chIndex, !here);     // the chapter in the stream keeps its files (anchors point at them)
-    this.ch = e.c; this.cur = -1; this.curWord = null;
+    if (view && gen !== routeGen) view = false;
+    const keep = view && !!this.root?.isConnected && this.root.dataset.key === `${bookId}:${chIndex}:${sig(e.c)}`;   // already showing it
+    this.ch = e.c;
+    if (!keep) { this.cur = -1; this.curWord = null; }
     this.remember(b, chIndex, e.c.title);
-    if (view) this.render(); else { this.unitEls = []; this.paintMini(); }
+    if (view) { if (!keep) this.render(); } else { this.unitEls = []; this.paintMini(); }
     this.layout();
     this.speed(store.get(`speed:${bookId}`, 1));
     if (!this.tape) { this.setState("error", "This browser can't play audio streams"); return; }
@@ -889,7 +1109,6 @@ const player = {
     }
     await Promise.all(e.files.filter((f) => f.ready && !f.idx).map((f) => this.loadFile(f).catch(() => {})));
     this.chs.set(n, e);
-    const sig = (ch) => ch.units.map((u) => `${u.block}:${u.start}`).join();
     if (this.root && this.ch?.index === n && sig(this.ch) !== sig(c)) { this.ch = c; this.render(); }   // re-segmented meanwhile
     this.relayout(e);
     return e;
@@ -1190,7 +1409,7 @@ const player = {
       this.layout();
       this.speed(audio.playbackRate);
       this.setPlayIcon(audio.paused);
-      history.replaceState(null, "", `#/read/${this.book.id}/${n}`);
+      nav.rename(`#/read/${this.book.id}/${n}`);       // same screen, the next chapter: no new history entry
     } else this.layout();
     this.media();
     this.paintMini();
@@ -1245,14 +1464,11 @@ const player = {
   render() {
     const b = this.book, ch = this.ch;
     this.clauses = new Map(); this.curClause = null;
-    const top = h("header", { class: "top reader-top" }, h("div", { class: "wrap" },
-      h("a", { class: "iconbtn", href: `#/book/${b.id}`, title: b.title, html: ICON.back }),
-      h("div", { class: "titles" }, h("div", { class: "kicker" }, b.title), h("div", { class: "ttl" }, chapterLabel(ch.title, b.lang))),
-      h("div", { class: "top-btns" },
-        this.$sound = h("button", { class: "iconbtn" + (ambient.kind !== "off" ? " on" : ""), title: "Background sound", "aria-label": "Background sound", html: ICON.sound, onclick: (e) => this.sheet("sound", e) }),
-        h("button", { class: "iconbtn", title: "Text", html: ICON.type, onclick: (e) => this.sheet("look", e) }))));
+    this.$sound = h("button", { class: "iconbtn" + (ambient.kind !== "off" ? " on" : ""), title: "Background sound", "aria-label": "Background sound", html: ICON.sound, onclick: (e) => this.sheet("sound", e) });
+    const top = this.readerTop(b.id, b.title, chapterLabel(ch.title, b.lang), h("div", { class: "top-btns" }, this.$sound,
+      h("button", { class: "iconbtn", title: "Text", "aria-label": "Text and theme", html: ICON.type, onclick: (e) => this.sheet("look", e) })));
     this.$top = top;
-    const page = h("article", { class: "page", lang: b.lang, "data-hl": prefs.highlight });
+    const page = h("article", { class: "page" + (app.querySelector(".sk-page") ? " fade-in" : ""), lang: b.lang, "data-hl": prefs.highlight });
     const byBlock = new Map();
     ch.units.forEach((u) => { if (!byBlock.has(u.block)) byBlock.set(u.block, []); byBlock.get(u.block).push(u); });
     this.unitEls = []; this.wordEls = [];
@@ -1290,12 +1506,13 @@ const player = {
     this.bindScrub(scrub);
     this.$.elapsed = h("span");
     this.$.remain = h("span");
+    this.$.bookLeft = h("span", { class: "book-left", title: "Time left in the book at this speed" });
     this.$.play = h("button", { class: "play", title: "Play (space)", html: ICON.play, onclick: () => this.toggle() });
     const ctrl = (icon, title, fn, cls = "") => h("button", { class: "iconbtn " + cls, title, "aria-label": title, html: icon, onclick: fn });
     this.$.speed = h("button", { class: "speedbtn", title: "Playback speed", onclick: (e) => this.sheet("speed", e) }, `${audio.playbackRate || 1}×`);
     this.$.status = h("div", { class: "float-status" });
     const bar = h("div", { class: "player" },
-      scrub, h("div", { class: "times" }, this.$.elapsed, this.$.remain),
+      scrub, h("div", { class: "times" }, this.$.elapsed, this.$.bookLeft, this.$.remain),
       h("div", { class: "ctrls" },
         this.$.speed,
         ctrl(skipIcon(-1), `Back ${prefs.skip} s`, () => this.skip(-1)),
@@ -1303,9 +1520,9 @@ const player = {
         ctrl(skipIcon(1), `Forward ${prefs.skip} s`, () => this.skip(1)),
         ctrl(ICON.list, "Chapters", (e) => this.sheet("chapters", e))));
     this.$.follow = h("button", { class: "follow", hidden: true, onclick: () => { this.follow = true; this.$.follow.hidden = true; this.scrollToCur(true); } }, "Back to narrator");
-    const main = h("main", { class: "reader" }, page);
+    const main = h("main", { class: "reader", "data-key": `${b.id}:${ch.index}:${sig(ch)}` }, page);
     this.root = main;
-    app.replaceChildren(top, main, this.$.follow, this.$.status, bar);
+    mount(top, main, this.$.follow, this.$.status, bar);
     // the header gets out of the way while reading down, and comes back when scrolling up
     let lastY = scrollY;
     removeEventListener("scroll", this.onScroll);
@@ -1321,43 +1538,86 @@ const player = {
     main.addEventListener("touchmove", stopFollow, { passive: true });
   },
 
+  // the reader's nav bar: back, the book and chapter, and one button on the right
+  readerTop(bookId, title, chTitle, trail) {
+    return h("header", { class: "top reader-top" }, h("div", { class: "wrap" },
+      h("div", { class: "lead" }, h("a", { class: "iconbtn", href: `#/book/${bookId}`, title: "Back", "aria-label": "Back", html: ICON.back,
+        onclick: (e) => { e.preventDefault(); goBack(`#/book/${bookId}`); } })),
+      h("div", { class: "titles" }, h("div", { class: "kicker" }, title || ""), h("div", { class: "ttl" }, chTitle || "")),
+      h("div", { class: "trail" }, trail)));
+  },
+  // the reader's outline while its text and audio load: the titles we know, lines of text, the player bar
+  skeleton(bookId, n) {
+    const lite = memo.get(`/api/books/${bookId}`) || memo.get("/api/books")?.find((x) => x.id === bookId);
+    const c = lite?.chapters?.find((x) => x.index === n);
+    const top = this.readerTop(bookId, lite?.title, c ? chapterLabel(c.title, lite.lang) : "",
+      h("div", { class: "top-btns", style: "opacity:.35" }, h("span", { class: "iconbtn", html: ICON.sound }), h("span", { class: "iconbtn", html: ICON.type })));
+    const widths = [97, 100, 93, 99, 62, 0, 100, 95, 98, 91, 97, 44, 0, 96, 100, 89, 97, 71, 0, 99, 94, 100, 58];
+    const page = h("article", { class: "page sk-page", "aria-busy": "true" },
+      h("div", { class: "sk sk-line", style: "width:42%;margin:1.4em auto 1.7em;height:1em" }),
+      widths.map((w) => (w ? h("div", { class: "sk sk-line", style: `width:${w}%` }) : h("div", { class: "sk-gap" }))));
+    const bar = h("div", { class: "player sk-player" },
+      h("div", { class: "scrub" }, h("div", { class: "track" })),
+      h("div", { class: "times" }, h("span", {}, "0:00"), h("span", { class: "book-left" }), h("span", {}, "")),
+      h("div", { class: "ctrls" }, h("span", { class: "speedbtn", style: "display:grid;place-items:center" }, `${store.get(`speed:${bookId}`, 1)}×`),
+        h("span", { class: "iconbtn", html: skipIcon(-1) }), h("span", { class: "play busy", html: ICON.spin }),
+        h("span", { class: "iconbtn", html: skipIcon(1) }), h("span", { class: "iconbtn", html: ICON.list })));
+    this.$ = null;
+    mount(top, h("main", { class: "reader" }, page), bar);
+  },
+
   sheet(kind, ev) {
-    ev.stopPropagation();
-    document.querySelector(".sheet")?.remove();
-    const s = h("div", { class: "sheet" + (kind === "speed" || kind === "chapters" ? " bottom" : ""), onclick: (e) => e.stopPropagation() });
+    ev?.stopPropagation();
     if (kind === "chapters") {
-      s.append(h("h3", {}, "Chapters"), h("div", { class: "list" }, this.book.chapters.filter((c) => c.n_units).map((c) =>
-        h("a", { href: `#/read/${this.book.id}/${c.index}/0`, class: c.index === this.ch.index ? "on" : "" }, h("span", {}, chapterLabel(c.title, this.book.lang)), h("span", { class: "muted" }, human(c.est))))));
+      openSheet((p) => {
+        const list = h("div", { class: "list" }, this.book.chapters.filter((c) => c.n_units).map((c) =>
+          h("a", { href: `#/read/${this.book.id}/${c.index}/0`, class: c.index === this.ch.index ? "on" : "",
+            onclick: (e) => { e.preventDefault(); navTo(`#/read/${this.book.id}/${c.index}/0`, { replace: true, dir: "fade" }); } },
+          h("span", {}, chapterLabel(c.title, this.book.lang)), h("span", { class: "muted" }, human(c.est)))));
+        p.append(h("h3", {}, "Chapters"), list);
+        requestAnimationFrame(() => { const on = list.querySelector(".on"); if (on) list.scrollTop = on.offsetTop - list.clientHeight / 2 + on.offsetHeight / 2; });
+      });
     } else if (kind === "speed") {
-      const val = h("div", { class: "speed-val" });
-      const slider = h("input", { type: "range", min: "0.5", max: "2.5", step: "0.05", value: String(audio.playbackRate), class: "speed-slider",
-        oninput: () => { this.speed(+slider.value); paint(); } });
-      const chips = h("div", { class: "opts" });
-      const paint = () => {
-        val.textContent = `${audio.playbackRate.toFixed(2).replace(/0$/, "")}×`;
-        slider.value = String(audio.playbackRate);
-        chips.replaceChildren(...SPEED_PRESETS.map((v) => h("button", { class: Math.abs(v - audio.playbackRate) < 0.001 ? "on" : "", onclick: () => { this.speed(v); paint(); } }, v === 1 ? "Normal" : `${v}×`)));
-      };
-      paint();
-      s.append(h("h3", {}, "Playback speed"), val, slider, chips);
+      openSheet((p) => {
+        const val = h("div", { class: "speed-val" });
+        const slider = h("input", { type: "range", min: "0.5", max: "2.5", step: "0.05", value: String(audio.playbackRate), class: "speed-slider",
+          oninput: () => { this.speed(+slider.value); paint(); } });
+        const chips = h("div", { class: "opts" });
+        const paint = () => {
+          val.textContent = `${audio.playbackRate.toFixed(2).replace(/0$/, "")}×`;
+          slider.value = String(audio.playbackRate);
+          chips.replaceChildren(...SPEED_PRESETS.map((v) => h("button", { class: Math.abs(v - audio.playbackRate) < 0.001 ? "on" : "", onclick: () => { this.speed(v); paint(); } }, v === 1 ? "Normal" : `${v}×`)));
+        };
+        paint();
+        p.append(h("h3", {}, "Playback speed"), h("div", { class: "group" }, val, slider, chips));
+      });
     } else if (kind === "sound") {
-      const cur = ambient.kind;
-      const pick = (k) => { ambient.pick(k); this.$sound?.classList.toggle("on", k !== "off"); this.sheet("sound", ev); };
-      const vol = h("input", { type: "range", min: "0", max: "1", step: "0.01", value: String(ambient.level), class: "speed-slider", "aria-label": "Background sound volume",
-        oninput: () => ambient.setLevel(+vol.value) });
-      s.append(h("h3", {}, "Background sound"),
-        h("div", { class: "opts" }, [["off", "Off"], ...SOUNDS].map(([k, l]) => h("button", { class: k === cur ? "on" : "", onclick: () => pick(k) }, l))));
-      if (cur !== "off") s.append(h("h3", {}, "Volume"), vol);
-      s.append(h("p", { class: "muted small sheet-note" }, cur === "focus" ? "Binaural beats: listen with headphones." : "Made on this phone and played under the narration. It follows play and pause."));
+      openSheet((p) => {
+        const body = h("div");
+        const paint = () => {
+          const cur = ambient.kind;
+          const pick = (k) => { ambient.pick(k); this.$sound?.classList.toggle("on", k !== "off"); paint(); };
+          const vol = h("input", { type: "range", min: "0", max: "1", step: "0.01", value: String(ambient.level), class: "speed-slider", style: "margin:0",
+            "aria-label": "Background sound volume", oninput: () => ambient.setLevel(+vol.value) });
+          fill(body, h("h3", {}, "Background sound"),
+            h("div", { class: "group" }, h("div", { class: "opts" }, [["off", "Off"], ...SOUNDS].map(([k, l]) => h("button", { class: k === cur ? "on" : "", onclick: () => pick(k) }, l)))),
+            cur !== "off" ? [h("h3", {}, "Volume"), h("div", { class: "group" }, vol)] : null,
+            h("p", { class: "muted small sheet-note" }, cur === "focus" ? "Binaural beats: listen with headphones." : "Made on this phone and played under the narration. It follows play and pause."));
+        };
+        paint();
+        p.append(body);
+      });
     } else {
-      const sizes = [17, 19, 21, 23, 26];
-      const themes = [["auto", "Auto"], ["light", "Light"], ["sepia", "Sepia"], ["dark", "Dark"], ["black", "Black"]];
-      const size = store.get("size", 21), theme = store.get("theme", "auto");
-      s.append(h("h3", {}, "Text size"), h("div", { class: "opts" }, sizes.map((z) => h("button", { class: z === size ? "on" : "", onclick: () => { store.set("size", z); applyLook(); this.sheet("look", ev); } }, String(z)))),
-        h("h3", {}, "Theme"), h("div", { class: "opts" }, themes.map(([k, l]) => h("button", { class: k === theme ? "on" : "", onclick: () => { store.set("theme", k); applyLook(); this.sheet("look", ev); } }, l))));
+      openSheet((p) => {
+        const body = h("div", { style: "overflow:auto;overscroll-behavior:contain;min-height:0" });
+        const paint = () => fill(body,
+          h("h3", {}, "Text size"), h("div", { class: "group" }, sizeStepper(paint)),
+          h("h3", {}, "Font"), h("div", { class: "group" }, fontChips(paint)),
+          h("h3", {}, "Theme"), h("div", { class: "group" }, themeTiles(paint)));
+        paint();
+        p.append(body);
+      });
     }
-    document.body.append(s);
-    setTimeout(() => addEventListener("click", () => s.remove(), { once: true }), 0);
   },
 
   // word spans only around the narration (a long chapter has thousands of words): the sentence being read, two
@@ -1565,7 +1825,7 @@ const player = {
       b.title = label;
     }
     this.say(msg, action, busy && !this.$?.play?.isConnected);      // the play button already spins on the reader
-    if (this.$mini?.sub) this.$mini.sub.textContent = msg && state !== "playing" ? msg : chapterLabel(this.ch?.title, this.book?.lang);
+    if (this.$mini?.sub && (msg || this.ch)) this.$mini.sub.textContent = msg && state !== "playing" ? msg : chapterLabel(this.ch?.title, this.book?.lang);
     try { if (navigator.mediaSession) navigator.mediaSession.playbackState = state === "playing" ? "playing" : "paused"; } catch {}
     ambient.follow(state);
   },
@@ -1597,10 +1857,45 @@ const player = {
     const play = h("button", { class: "mini-play" + (busy ? " busy" : ""), "aria-label": "Play or pause", html: live && this.state === "playing" ? ICON.pause : busy ? ICON.spin : ICON.play,
       onclick: (e) => { e.preventDefault(); e.stopPropagation(); this.tape && this.book?.id === b.id ? this.toggle() : this.startHere(b.id, n); } });
     const sub = h("div", { class: "s" }, live && this.stateMsg && this.state !== "playing" ? this.stateMsg : chapterLabel(live ? this.ch.title : r.chTitle, b.lang));
-    const el = h("a", { class: "mini", href: `#/read/${b.id}/${n}` }, coverEl(b), h("div", { class: "grow" }, h("div", { class: "t" }, b.title), sub), play);
-    this.$mini = { el, play, sub };
+    // the book and what's left of it; the chapter and what's left of it; a thin line for the chapter
+    const bookT = h("span", { class: "tm", title: "Left in the book" }), chT = h("span", { class: "tm", title: "Left in the chapter" });
+    const bar = h("i"), prog = h("div", { class: "mini-prog", hidden: true }, bar);
+    const el = h("a", { class: "mini", href: `#/read/${b.id}/${n}` }, coverEl(b),
+      h("div", { class: "grow" }, h("div", { class: "l1" }, h("div", { class: "t" }, b.title), bookT), h("div", { class: "l2" }, sub, chT)), play, prog);
+    this.$mini = { el, play, sub, bookT, chT, bar, prog, id: b.id, ch: n };
     document.body.classList.add("has-mini");
+    this.paintMiniTime();
     return el;
+  },
+  // time left in the book from chapter time t, at the current speed: what's left of this chapter, plus the
+  // estimated length of every chapter after it that will play
+  bookLeft(t = this.chapterTime()) {
+    if (!this.book?.chapters || !this.ch) return null;
+    const total = this.chapterTotal() || this.book.chapters.find((c) => c.index === this.ch.index)?.est || 0;
+    let s = Math.max(0, total - t);
+    for (const c of this.book.chapters) if (c.index > this.ch.index && c.include && c.n_units) s += c.est || 0;
+    return s / (audio.playbackRate || 1);
+  },
+  paintMiniTime() {
+    const m = this.$mini;
+    if (!m) return;
+    let chLeft = "", bookLeft = "", frac = null;
+    if (this.tape && this.book?.id === m.id && this.ch) {        // playing (or loaded): exact
+      const t = this.chapterTime(), total = this.chapterTotal(), rate = audio.playbackRate || 1;
+      if (total) { chLeft = `−${fmt(Math.max(0, total - t) / rate)}`; frac = Math.min(1, t / total); }
+      const left = this.bookLeft(t);
+      if (left != null) bookLeft = left < 60 ? "< 1m left" : `${short(left)} left`;
+    } else {                                                        // nothing loaded yet: from your saved place
+      const lb = memo.get("/api/books")?.find((x) => x.id === m.id);
+      const rate = store.get(`speed:${m.id}`, 1) || 1;
+      if (lb?.progress?.total_est) bookLeft = `${short(Math.max(0, lb.progress.total_est - (lb.progress.heard_est || 0)) / rate)} left`;
+      const pos = lb && positions.best(m.id, lb.position), c = pos && lb.chapters.find((x) => x.index === pos.chapter);
+      if (c?.est && pos.t != null) frac = Math.min(1, pos.t / c.est);
+    }
+    if (m.chT.textContent !== chLeft) m.chT.textContent = chLeft;
+    if (m.bookT.textContent !== bookLeft) m.bookT.textContent = bookLeft;
+    m.prog.hidden = frac == null;
+    if (frac != null) m.bar.style.width = `${(100 * frac).toFixed(2)}%`;
   },
   // play from the bottom bar without opening the book (cold start: nothing loaded yet)
   async startHere(id, n) {
@@ -1613,6 +1908,8 @@ const player = {
     if (!this.$mini?.el.isConnected) return;
     this.$mini.el.setAttribute("href", `#/read/${this.book.id}/${this.ch.index}`);
     this.$mini.sub.textContent = chapterLabel(this.ch.title, this.book.lang);
+    Object.assign(this.$mini, { id: this.book.id, ch: this.ch.index });
+    this.paintMiniTime();
   },
   step(d) {
     const T = this.chapterTime();
@@ -1705,6 +2002,9 @@ const player = {
     const exact = (this.chs.get(this.ch.index)?.files || []).every((f) => f.idx);
     this.$.elapsed.textContent = fmt(t / rate);
     this.$.remain.textContent = `${exact ? "−" : "≈ "}${fmt(Math.max(0, total - t) / rate)}`;
+    const left = this.bookLeft(t);
+    const bl = left == null ? "" : left < 60 ? "Under a minute left" : `${short(left)} left in book`;
+    if (this.$.bookLeft.textContent !== bl) this.$.bookLeft.textContent = bl;
     const f = Math.min(1, t / Math.max(total, 1));
     this.$.knob.style.left = `${100 * f}%`;
     if (this.$.played) this.$.played.style.width = `${100 * f}%`;
@@ -1773,9 +2073,9 @@ const player = {
 audio.addEventListener("ended", () => player.tape && player.onEnded());
 audio.addEventListener("error", () => player.onMediaError());
 audio.addEventListener("waiting", () => player.tape && player.onStall());
-audio.addEventListener("timeupdate", () => { player.pump(); if (document.hidden) player.update(); });
+audio.addEventListener("timeupdate", () => { player.pump(); if (document.hidden) player.update(); else player.paintMiniTime(); });
 audio.addEventListener("playing", () => { clearTimeout(player.stallTimer); clearInterval(player.etaTimer); player.retry = 0; player.setState("playing"); player.positionState(); player.loop(); });
-audio.addEventListener("seeked", () => { player.positionState(); player.loop(); });
+audio.addEventListener("seeked", () => { player.positionState(); player.loop(); player.paintMiniTime(); });
 audio.addEventListener("pause", () => {
   player.wake(false);
   // we paused to wait (holding, or already "waiting": the event arrives after the flag is gone): the state says why
@@ -1785,7 +2085,7 @@ audio.addEventListener("pause", () => {
   player.stoppedAt = Date.now();     // user pause *or* a system interruption (call, Siri, navigation)
   player.save();
 });
-audio.addEventListener("ratechange", () => { player.positionState(); if (player.$?.speed) player.$.speed.textContent = `${audio.playbackRate}×`; });
+audio.addEventListener("ratechange", () => { player.positionState(); if (player.$?.speed) player.$.speed.textContent = `${audio.playbackRate}×`; player.paintMiniTime(); });
 // stopped by the system and resumed by the system (no tap): still go back a bit
 audio.addEventListener("play", () => {
   if (!player.tape || !player.stoppedAt || Date.now() - (player.ownPlayAt || 0) < 2000) return;
@@ -1796,7 +2096,7 @@ audio.addEventListener("play", () => {
 });
 setInterval(() => { if (player.tape && !audio.paused) player.save(); }, 5000);
 document.addEventListener("visibilitychange", () => { clog("visibility", document.visibilityState); if (document.visibilityState === "hidden") player.save(); else player.update(); });
-clog("start", `${navigator.userAgent.slice(0, 120)} · ${matchMedia("(display-mode: standalone)").matches ? "installed" : "browser"} · ${MSE === window.MediaSource ? "MediaSource" : "ManagedMediaSource"}`);
+clog("start", `${navigator.userAgent.slice(0, 120)} · ${screen.width}x${screen.height}@${devicePixelRatio} · ${matchMedia("(display-mode: standalone)").matches ? "installed" : "browser"} · ${MSE === window.MediaSource ? "MediaSource" : "ManagedMediaSource"}`);
 
 addEventListener("keydown", (e) => {
   if (!player.root || e.target.closest("input,select,textarea")) return;
@@ -1805,26 +2105,240 @@ addEventListener("keydown", (e) => {
   else if (e.code === "ArrowRight") { e.preventDefault(); e.shiftKey ? player.skip(1) : player.step(1); }
 });
 
-// ------------------------------------------------------------------ router
-async function route() {
+// ------------------------------------------------------------------ navigation: a stack of screens, like a native app's
+// Every history entry knows its place in the stack (history.state.i), so a hash change can tell a push from a pop.
+// Pushes slide in from the right, pops slide back, and the edge swipe pops with the finger. Back buttons pop
+// (history.back) when the screen before is where they lead, so history and stack never drift apart.
+history.scrollRestoration = "manual";
+const nav = {
+  i: 0,
+  pages: [],          // [{hash, y, snap}]: y, where it was scrolled when we left it; snap, a picture of it for the swipe
+  next: null,         // what navTo/goBack asked for, for the hash change it causes
+  load() {
+    try {
+      const s = JSON.parse(sessionStorage.getItem("reader:nav"));
+      if (s?.pages?.length && history.state?.i != null && history.state.i < s.pages.length) { this.pages = s.pages; this.i = history.state.i; return true; }
+    } catch {}
+    return false;
+  },
+  save() { try { sessionStorage.setItem("reader:nav", JSON.stringify({ pages: this.pages.map(({ hash, y }) => ({ hash, y })) })); } catch {} },
+  rename(hash) {      // the same screen under another address (the reader moving on to the next chapter)
+    history.replaceState({ i: this.i }, "", hash);
+    if (this.pages[this.i]) this.pages[this.i].hash = hash;
+    this.save(); rememberScreen();
+  },
+};
+const screenOf = (hash) => (hash || "#/").replace(/^#/, "").split("?")[0].split("/").filter(Boolean);
+const screenName = (hash) => {
+  const [k, id] = screenOf(hash);
+  if (k === "settings") return "Settings";
+  if (k === "system") return "Rendering";
+  if (k === "book") return memo.get(`/api/books/${id}`)?.title || memo.get("/api/books")?.find((b) => b.id === id)?.title || "Book";
+  if (k === "read") return "Back";
+  return "Library";
+};
+const parentOf = (hash) => { const [k, id] = screenOf(hash); return k === "read" ? `#/book/${id}` : k ? "#/" : null; };
+function navTo(hash, { replace = false, dir = replace ? "fade" : "forward" } = {}) {
+  if (hash === location.hash) return route("none");
+  nav.next = { dir, replace };
+  if (replace) location.replace(hash); else location.hash = hash;
+}
+function goBack(parent) {
+  if (nav.i > 0) { nav.next = { dir: "back" }; history.back(); }
+  else if (parent) navTo(parent, { replace: true, dir: "back" });
+}
+// a picture of the screen being left (for the swipe back to show underneath it)
+function snapshot() {
+  if (!app.children.length) return null;
+  return { y: scrollY, bg: getComputedStyle(document.documentElement).backgroundColor, topH: app.querySelector(":scope > header")?.offsetHeight || 0,
+    nodes: [...app.children].map((el) => el.cloneNode(true)) };
+}
+function onHashChange() {
+  const st = history.state, req = nav.next;
+  nav.next = null;
+  const leaving = nav.pages[nav.i];
+  if (leaving) leaving.y = scrollY;
+  let dir;
+  if (req?.replace) {                                  // another screen in the same place of the stack
+    history.replaceState({ i: nav.i }, "");
+    nav.pages[nav.i] = { hash: location.hash };
+    dir = req.dir;
+  } else if (st?.i == null) {                          // a new entry: push
+    if (leaving) leaving.snap = snapshot();
+    nav.i += 1;
+    nav.pages.length = nav.i;
+    nav.pages.push({ hash: location.hash });
+    history.replaceState({ i: nav.i }, "");
+    dir = "forward";
+  } else {                                             // back or forward through history
+    dir = st.i < nav.i ? "back" : "forward";
+    if (dir === "forward" && leaving) leaving.snap = snapshot();
+    nav.i = st.i;
+    nav.pages[nav.i] = { ...(nav.pages[nav.i] || {}), hash: location.hash };
+  }
+  if (swipe.done) dir = "swipe";
+  nav.save();
+  route(dir);
+}
+// where you were, so a cold start (iOS closed the app in the background) opens there again
+function rememberScreen() {
+  const [k, id, n] = screenOf(location.hash);
+  store.set("last", { hash: k === "read" ? `#/read/${id}/${n || 1}` : location.hash.split("?")[0] || "#/", at: Date.now() });
+}
+
+let routeGen = 0;
+function route(dir = "none") {
+  const gen = ++routeGen;
   const [path, query] = location.hash.slice(1).split("?");
   const parts = (path || "/").split("/").filter(Boolean);
-  document.body.classList.remove("has-mini");
-  document.querySelectorAll(".sheet, .toast").forEach((el) => el.remove());
-  if (parts[0] !== "read") scrollTo(0, 0);
+  const y = dir === "back" || dir === "swipe" ? nav.pages[nav.i]?.y || 0 : 0;
+  rememberScreen();
+  const run = () => {
+    document.body.classList.remove("has-mini");
+    closeSheets(true);
+    document.querySelectorAll(".toast").forEach((el) => el.remove());
+    document.documentElement.classList.toggle("grouped", parts[0] === "settings" || parts[0] === "system");
+    let p;
+    try {
+      if (parts[0] === "book" && parts[1]) p = viewBook(parts[1]);
+      else if (parts[0] === "system") p = viewSystem();
+      else if (parts[0] === "settings") p = viewSettings();
+      else if (parts[0] === "read" && parts[1]) p = player.open(parts[1], +parts[2] || 1, parts[3] != null ? +parts[3] : undefined, query === "play");
+      else p = viewLibrary();
+    } catch (e) { p = Promise.reject(e); }
+    if (parts[0] !== "read") scrollTo(0, y);
+    chromeOnScroll();
+    syncChrome();
+    edge.hidden = !parts.length;
+    Promise.resolve(p).catch((e) => { clog("view-error", e?.message); if (gen === routeGen) showError(e); });
+  };
+  const animate = dir !== "none" && dir !== "swipe" && document.startViewTransition && document.visibilityState === "visible"
+    && !matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!animate) { run(); if (dir === "swipe") swipeFinish(); return; }
+  const root = document.documentElement;
+  root.dataset.nav = dir;
   try {
-    if (parts[0] === "book" && parts[1]) await viewBook(parts[1]);
-    else if (parts[0] === "system") await viewSystem();
-    else if (parts[0] === "settings") viewSettings();
-    else if (parts[0] === "read" && parts[1]) await player.open(parts[1], +parts[2] || 1, parts[3] != null ? +parts[3] : undefined, query === "play");
-    else await viewLibrary();
-  } catch (e) {
-    app.replaceChildren(h("main", { class: "wrap" }, h("div", { class: "empty", style: "margin-top:3rem" }, h("h2", {}, "Something went wrong"), h("p", {}, e.message),
-      h("a", { class: "btn", href: "#/" }, "Library"))));
-  }
+    document.startViewTransition(run).finished.finally(() => { if (root.dataset.nav === dir) delete root.dataset.nav; });
+  } catch { delete root.dataset.nav; run(); }
 }
-addEventListener("hashchange", route);
-route();
+function showError(e) {
+  const parts = screenOf(location.hash);
+  mount(topbar({ lead: parts.length ? back(parentOf(location.hash)) : null }),
+    h("main", { class: "wrap" }, h("div", { class: "error-view" }, h("span", { html: ICON2.warn }),
+      h("h2", {}, navigator.onLine ? "Couldn't load this" : "You're offline"), h("p", {}, navigator.onLine ? e.message : "This isn't on the phone yet."),
+      h("button", { class: "btn", onclick: () => route("none") }, "Try again"))), player.mini());
+}
+
+// ------------------------------------------------------------------ the edge swipe back
+// A strip along the left edge (below the nav bar) catches the swipe: the screen follows the finger, the screen
+// before it waits underneath, a little to the left and dimmed, as on iOS. Let go past ~40% (or flick) to go back.
+const edge = h("div", { class: "edge-swipe", hidden: true });
+document.body.append(edge);
+const swipe = { armed: false, on: false, done: false, dx: 0, hist: [], els: [], under: null, dim: null, back: null };
+edge.addEventListener("touchstart", (e) => {
+  if (e.touches.length !== 1 || sheets.size || swipe.on || swipe.done) return;
+  const t = e.touches[0];
+  Object.assign(swipe, { armed: true, x0: t.clientX, y0: t.clientY, dx: 0, hist: [[performance.now(), 0]] });
+}, { passive: true });
+edge.addEventListener("touchmove", (e) => {
+  if (!swipe.armed) return;
+  const t = e.touches[0], dx = t.clientX - swipe.x0, dy = t.clientY - swipe.y0;
+  if (!swipe.on) {
+    if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) { swipe.armed = false; return; }
+    if (dx < 8) return;
+    swipeStart();
+  }
+  e.preventDefault();
+  swipe.dx = Math.max(0, dx);
+  swipe.hist.push([performance.now(), swipe.dx]);
+  if (swipe.hist.length > 5) swipe.hist.shift();
+  swipeMove(swipe.dx);
+}, { passive: false });
+edge.addEventListener("touchend", () => swipeEnd(false));
+edge.addEventListener("touchcancel", () => swipeEnd(true));       // iOS took the gesture over: put everything back
+// a tap on the strip (no swipe) goes to what's under it
+edge.addEventListener("click", (e) => {
+  edge.style.pointerEvents = "none";
+  const under = document.elementFromPoint(e.clientX, e.clientY);
+  edge.style.pointerEvents = "";
+  under?.click?.();
+});
+function swipeStart() {
+  swipe.on = true;
+  const prev = nav.i > 0 ? nav.pages[nav.i - 1] : null, snap = prev?.snap;
+  const under = h("div", { class: "under", style: snap ? `background:${snap.bg}` : "" });
+  if (snap) {
+    const nodes = snap.nodes.map((n) => n.cloneNode(true));
+    const top = nodes.find((n) => n.tagName === "HEADER"), main = nodes.find((n) => n.tagName === "MAIN");
+    under.append(h("div", { class: "under-scroll", style: `transform:translateY(${-snap.y}px)` }, h("div", { style: `height:${snap.topH}px` }), main || null));
+    if (top) under.append(top);
+    under.append(...nodes.filter((n) => n !== top && n !== main));
+  }
+  swipe.dim = h("div", { class: "dim", style: "opacity:.1" });
+  under.append(swipe.dim);
+  swipe.under = under;
+  swipe.back = h("div", { class: "swipe-back" });
+  document.documentElement.classList.add("swiping");
+  document.body.prepend(under, swipe.back);
+  swipe.els = [...app.children, swipe.back];
+  swipeMove(0);
+}
+function swipeMove(dx) {
+  const W = innerWidth, p = Math.min(1, dx / W);
+  for (const el of swipe.els) el.style.translate = `${dx.toFixed(1)}px 0`;
+  if (swipe.under) swipe.under.style.translate = `${(-0.28 * W * (1 - p)).toFixed(1)}px 0`;
+  if (swipe.dim) swipe.dim.style.opacity = (0.1 * (1 - p)).toFixed(3);
+}
+function swipeEnd(cancelled) {
+  if (!swipe.on) { swipe.armed = false; return; }
+  swipe.armed = false;
+  const W = innerWidth, [t0, x0] = swipe.hist[0], [t1, x1] = swipe.hist.at(-1);
+  const v = (x1 - x0) / Math.max(1, t1 - t0);          // px per ms, over the last few moves
+  const go = !cancelled && (swipe.dx > W * 0.4 || (v > 0.3 && swipe.dx > 30));
+  const ms = Math.round(go ? Math.max(140, Math.min(320, (W - swipe.dx) / Math.max(v, 1.2))) : 240);
+  const ease = "cubic-bezier(.2, .8, .25, 1)";
+  for (const el of [...swipe.els, swipe.under]) el.style.transition = `translate ${ms}ms ${ease}`;
+  swipe.dim.style.transition = `opacity ${ms}ms ${ease}`;
+  swipeMove(go ? W : 0);
+  setTimeout(() => {
+    if (!go) return swipeFinish();
+    swipe.done = true;
+    goBack(parentOf(location.hash));
+    setTimeout(() => { if (swipe.done) { swipeFinish(); route("none"); } }, 800);      // the hash change never came
+  }, ms);
+}
+function swipeFinish() {
+  for (const el of swipe.els) { el.style.translate = ""; el.style.transition = ""; }
+  swipe.under?.remove(); swipe.back?.remove();
+  document.documentElement.classList.remove("swiping");
+  Object.assign(swipe, { on: false, done: false, els: [], under: null, dim: null, back: null });
+}
+
+// ------------------------------------------------------------------ start
+// enable :active on iOS (it only applies when the page listens for touches)
+document.addEventListener("touchstart", () => {}, { passive: true });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") rememberScreen(); });
+addEventListener("hashchange", onHashChange);
+(async function boot() {
+  if (!nav.load()) {
+    // a fresh start: rebuild the stack under the screen we open (library, book, reader), so back and the swipe work.
+    // Opened plainly (the home screen icon), reopen where you were if that was in the last 12 hours.
+    const last = store.get("last", null);
+    const plain = !location.hash || location.hash === "#" || location.hash === "#/";
+    const target = plain ? (last?.hash && Date.now() - last.at < 12 * 3600e3 ? last.hash : "#/") : location.hash;
+    const chain = [];
+    for (let x = target; x; x = parentOf(x)) chain.unshift(x);
+    if (chain[0] !== "#/") chain.unshift("#/");
+    history.replaceState({ i: 0 }, "", chain[0]);
+    for (let k = 1; k < chain.length; k++) history.pushState({ i: k }, "", chain[k]);
+    nav.pages = chain.map((hash) => ({ hash }));
+    nav.i = chain.length - 1;
+    nav.save();
+  }
+  const [k, id] = screenOf(location.hash);
+  await Promise.race([warmMemo(["/api/books", (k === "book" || k === "read") && `/api/books/${id}`]), new Promise((r) => setTimeout(r, 150))]);
+  route("none");
+})();
 setTimeout(() => offline.syncAll(), 3000);
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});

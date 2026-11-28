@@ -195,12 +195,23 @@ def synth_job(lang: str, voice: str, text: str, seed: int, context: np.ndarray |
 
 def _worker_init():
     """In each synthesizer process: if memory ever runs out, be the one the kernel stops. The pool replaces it and
-    the sentence is rendered again; the process serving the app is left alone."""
+    the sentence is rendered again; the process serving the app is left alone.
+    And go when the app's process goes: a pool process holds both ends of its job queue, so it never hears that the
+    app died and waits for work forever, model loaded (2026-11-28: four left by a test instance killed the day
+    before held 2 GB and all of the swap)."""
     try:
         with open("/proc/self/oom_score_adj", "w") as f:
             f.write("1000")
     except OSError:
         pass
+    parent = os.getppid()
+
+    def watch():
+        import time
+        while os.getppid() == parent:
+            time.sleep(5)
+        os._exit(0)
+    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
 
 
 def synth_pool(size: int):

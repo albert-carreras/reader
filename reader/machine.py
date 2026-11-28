@@ -79,12 +79,25 @@ def _power() -> dict | None:
     return None
 
 
+def _used(cg: Path | None) -> int | None:
+    """Memory this service holds: its cgroup's usage less the file cache the kernel drops first (inactive_file: audio
+    it served, model files it read). memory.current counts that cache too, so an idle service after a day of
+    rendering read 1.4 GB while its processes held 0.7 (2026-11-28); the machine's figure (MemAvailable) already
+    counts cache as free."""
+    cur = _limit(cg, "memory.current")
+    if cur is None:
+        return None
+    stat = _read(cg / "memory.stat") or ""
+    cache = next((int(x.split()[1]) for x in stat.splitlines() if x.startswith("inactive_file ")), 0)
+    return max(0, cur - cache)
+
+
 def headroom_gb() -> float:
     """Memory this service can still take: what's left under its own limit, or the machine's available memory if
     that is less."""
     avail = _meminfo().get("MemAvailable", 0) / 2**30 or 99.0
     cg = _cgroup()
-    cap, cur = _limit(cg, "memory.max"), _limit(cg, "memory.current")
+    cap, cur = _limit(cg, "memory.max"), _used(cg)
     if cap and cur is not None:
         return min(avail, (cap - cur) / 2**30)
     return avail
@@ -105,7 +118,7 @@ def snapshot() -> dict:
     mine = min(cpu, 100 * (now[2] - prev[2]) / dt / cores) if now[2] else None
     mi = _meminfo()
     cg = _cgroup()
-    used_by_me = _limit(cg, "memory.current")
+    used_by_me = _used(cg)
     return dict(
         cores=cores,
         cpu=round(cpu, 1),                                   # % of the whole machine
